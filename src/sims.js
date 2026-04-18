@@ -1815,17 +1815,34 @@ SIMS.slam = function(container){
     let v = 1.0 * Math.max(0, Math.cos(dth));
     if(Math.abs(dth) > 0.9) v = 0;
 
-    // Slow down only when *the direction we are actually going* is close to
-    // a wall. Using a lookahead point instead of the robot center means that
-    // being 0.6 m from a wall to the side no longer throttles us.
+    // Slow down only when the direction we're actually going is close to
+    // a wall. Use a lookahead point instead of the robot center, so a wall
+    // 0.7 m to the side doesn't throttle us when we're heading past it.
     const look = 0.45;
     const px = robot.x + Math.cos(robot.th) * look;
     const py = robot.y + Math.sin(robot.th) * look;
-    const nw    = nearestWall(px, py);
+    const nwAhead = nearestWall(px, py);
     const clear = ROBOT_R + WALL_PAD;
-    if(nw < SLOW_R){
-      const scale = Math.max(0, (nw - clear) / (SLOW_R - clear));
+    if(nwAhead < SLOW_R){
+      const scale = Math.max(0, (nwAhead - clear) / (SLOW_R - clear));
       v *= scale;
+    }
+
+    // ESCAPE: when the forward path is genuinely blocked, override the
+    // potential-field command with a rotation toward whichever side has
+    // more clearance. Breaks local minima where goal and repulsion cancel
+    // along the robot's heading.
+    if(nwAhead < clear + 0.05){
+      const SIDE = 0.7;        // rad, check clearance this far off-axis
+      const pxL = robot.x + Math.cos(robot.th + SIDE) * look;
+      const pyL = robot.y + Math.sin(robot.th + SIDE) * look;
+      const pxR = robot.x + Math.cos(robot.th - SIDE) * look;
+      const pyR = robot.y + Math.sin(robot.th - SIDE) * look;
+      const nwL = nearestWall(pxL, pyL);
+      const nwR = nearestWall(pxR, pyR);
+      robot.w  = (nwL > nwR ? +1 : -1) * 1.3;
+      desiredTh = robot.th + (nwL > nwR ? +SIDE : -SIDE); // nudge the filter
+      v = 0;
     }
     robot.v = v;
 
