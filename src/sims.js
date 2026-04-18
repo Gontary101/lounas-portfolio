@@ -1451,11 +1451,13 @@ SIMS.slam = function(container){
     segments.push({x0:-W,y0: H,x1:-W,y1:-H});
 
     // Generate candidate internal walls, rejecting any that come too close
-    // to the robot spawn or the four patrol waypoints.
+    // to the robot spawn, the patrol waypoints, OR any previously accepted
+    // wall. That keeps corridors wide enough for the robot to fit.
     const protect = [[0,0], ...waypoints];
-    const CLEAR = 0.9;
+    const POINT_CLEAR = 0.9;
+    const WALL_CLEAR  = ROBOT_R * 2 + 0.35;   // ≈ 1 m corridor width
     let tries = 0;
-    while(segments.length < 10 && tries++ < 80){
+    while(segments.length < 10 && tries++ < 120){
       let cand;
       if(Math.random()<0.5){
         const y  = (Math.random()-0.5)*2*(H-1.5);
@@ -1470,7 +1472,21 @@ SIMS.slam = function(container){
       }
       let ok = true;
       for(const p of protect){
-        if(distPointSeg(p[0], p[1], cand).d < CLEAR){ ok = false; break; }
+        if(distPointSeg(p[0], p[1], cand).d < POINT_CLEAR){ ok = false; break; }
+      }
+      if(ok){
+        // Minimum separation from every existing wall — skip the outer 4 walls
+        // (candidate endpoints are already inside the room).
+        for(let i = 4; i < segments.length; i++){
+          const s2 = segments[i];
+          const dA = Math.min(
+            distPointSeg(cand.x0, cand.y0, s2).d,
+            distPointSeg(cand.x1, cand.y1, s2).d,
+            distPointSeg(s2.x0, s2.y0, cand).d,
+            distPointSeg(s2.x1, s2.y1, cand).d
+          );
+          if(dA < WALL_CLEAR){ ok = false; break; }
+        }
       }
       if(ok) segments.push(cand);
     }
@@ -1515,8 +1531,8 @@ SIMS.slam = function(container){
 
   // ---- wall collision helpers
   const ROBOT_R = 0.32;          // physical robot radius
-  const WALL_PAD = 0.22;         // wall half-thickness + safety slack
-  const SLOW_R  = 0.9;           // start slowing down this far from nearest wall
+  const WALL_PAD = 0.12;         // wall half-thickness + slim safety slack
+  const SLOW_R  = 0.75;          // slowdown starts here (measured from lookahead)
 
   // Closest-point distance from (px, py) to segment s
   function distPointSeg(px, py, s){
@@ -1587,13 +1603,14 @@ SIMS.slam = function(container){
     }
   }
 
-  function integrateScan(rx, ry, beams, maxR){
+  function integrateScan(rx, ry, rth, beams, maxR){
     const [gx0, gy0] = w2g(rx, ry);
     for(let i=0; i<beams.length; i+=2){  // every 2nd beam for speed
       const b = beams[i];
       const hit = b.r < maxR - 0.05;
-      const ex = rx + Math.cos(b.a) * b.r;
-      const ey = ry + Math.sin(b.a) * b.r;
+      const wa = rth + b.rel;              // world bearing consistent with rx,ry,rth
+      const ex = rx + Math.cos(wa) * b.r;
+      const ey = ry + Math.sin(wa) * b.r;
       const [gx1, gy1] = w2g(ex, ey);
       bresenham(gx0, gy0, gx1, gy1, (x, y) => {
         if(x < 0 || y < 0 || x >= GRID_W || y >= GRID_H) return false;
@@ -1778,24 +1795,33 @@ SIMS.slam = function(container){
     }
 
     // desired heading = goal direction + repulsion from nearby walls
-    const REPEL_R = 1.1, REPEL_K = 1.2;     // softer potential field
+    const REPEL_R = 1.0, REPEL_K = 1.2;
     const rep = wallRepulse(robot.x, robot.y, REPEL_R);
     const dx = (gx / Math.max(0.001, gd)) + rep.fx * REPEL_K;
     const dy = (gy / Math.max(0.001, gd)) + rep.fy * REPEL_K;
     const rawWant = Math.atan2(dy, dx);
 
-    // Low-pass the target heading so repulsion jitter doesn't spin the robot.
+    // dt-correct low-pass so the filter behaves the same across frame rates.
+    const TAU = 0.18;
+    const alpha = 1 - Math.exp(-dt / TAU);
     const dTarget = wrap(rawWant - desiredTh);
-    desiredTh = wrap(desiredTh + dTarget * 0.25);
+    desiredTh = wrap(desiredTh + dTarget * alpha);
 
     const dth = wrap(desiredTh - robot.th);
     robot.w = Math.max(-1.4, Math.min(1.4, dth * 1.7));
-    let v = 0.5 + Math.max(0, Math.cos(dth)) * 0.6;
 
-    // Slow down when close to a wall so we never pin ourselves at the
-    // collision threshold. Scales v linearly from full speed at SLOW_R
-    // down to 0 once we're at the clearance circle.
-    const nw    = nearestWall(robot.x, robot.y);
+    // Forward speed strongly gated by heading error — turn first, drive second.
+    // Zero forward speed past ~50° error prevents nose-into-wall wobble.
+    let v = 1.0 * Math.max(0, Math.cos(dth));
+    if(Math.abs(dth) > 0.9) v = 0;
+
+    // Slow down only when *the direction we are actually going* is close to
+    // a wall. Using a lookahead point instead of the robot center means that
+    // being 0.6 m from a wall to the side no longer throttles us.
+    const look = 0.45;
+    const px = robot.x + Math.cos(robot.th) * look;
+    const py = robot.y + Math.sin(robot.th) * look;
+    const nw    = nearestWall(px, py);
     const clear = ROBOT_R + WALL_PAD;
     if(nw < SLOW_R){
       const scale = Math.max(0, (nw - clear) / (SLOW_R - clear));
@@ -1840,9 +1866,10 @@ SIMS.slam = function(container){
   function lidarScan(){
     const beams = new Array(BEAMS);
     for(let i=0; i<BEAMS; i++){
-      const a = robot.th + (-Math.PI + (i/BEAMS) * 2*Math.PI);
-      const r = raycast(robot.x, robot.y, Math.cos(a), Math.sin(a), MAX_R);
-      beams[i] = { a, r: r + (Math.random()-0.5)*0.04 };
+      const rel = -Math.PI + (i/BEAMS) * 2*Math.PI;   // body-frame bearing
+      const a   = robot.th + rel;                     // world bearing (truth)
+      const r   = raycast(robot.x, robot.y, Math.cos(a), Math.sin(a), MAX_R);
+      beams[i] = { rel, a, r: r + (Math.random()-0.5)*0.04 };
     }
     return beams;
   }
@@ -1879,7 +1906,7 @@ SIMS.slam = function(container){
     for(const p of particles){
       let logw = 0;
       for(const b of sub){
-        const a = p.th + (b.a - robot.th);
+        const a = p.th + b.rel;
         const predR = raycast(p.x, p.y, Math.cos(a), Math.sin(a), MAX_R);
         const diff = predR - b.r;
         logw += -(diff*diff) / (2*sigma*sigma);
@@ -2002,7 +2029,7 @@ SIMS.slam = function(container){
     drawParticles();
 
     const mean = pfMean();
-    integrateScan(mean.x, mean.y, beams, MAX_R);
+    integrateScan(mean.x, mean.y, mean.th, beams, MAX_R);
     if(step % 3 === 0) redrawMap();
 
     ekfPredict(dt);

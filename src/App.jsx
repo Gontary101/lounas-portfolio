@@ -261,7 +261,7 @@ function SimsSection() {
                 particle filter, covariance ellipse
               </span>
             }
-            caption="Robot patrols a procedural room. LiDAR sweeps feed a log-odds occupancy grid. A 180-particle filter localizes via scan-matching; a 3-state EKF fuses the PF mean to drive the covariance ellipse."
+            caption="Robot patrols a procedural room. LiDAR → log-odds occupancy grid with estimated-pose insertion; 180-particle MCL with scan-matching likelihood; 3-state EKF fuses the PF mean to drive the covariance ellipse. Particle weighting uses the ground-truth map — a 2D mapping demo with truth-assisted localization, not full SLAM."
             controls={(simRef) => (
               <>
                 <button className="btn" onClick={() => simRef.current?.randomize()}>
