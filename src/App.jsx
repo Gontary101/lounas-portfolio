@@ -356,7 +356,7 @@ function Projects() {
                     {p.videos && p.videos.length > 0 && (
                       <>
                         <h4 style={{ marginTop: 20 }}>Demo videos</h4>
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                        <div style={{ display: 'grid', gridTemplateColumns: `repeat(${Math.min(p.videos.length, 2)}, minmax(0, 1fr))`, gap: 12 }}>
                           {p.videos.map((v, i) => (
                             <div key={i}>
                               <video
