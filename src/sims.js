@@ -1422,12 +1422,12 @@ SIMS.slam = function(container){
   const ortho = () => {
     const r = container.getBoundingClientRect();
     const aspect = r.width / r.height;
-    const sz = 16;
+    const sz = 18;
     return new THREE.OrthographicCamera(-sz*aspect/2, sz*aspect/2, sz/2, -sz/2, -80, 80);
   };
   let camera = ortho();
-  camera.position.set(3, 16, 3); // mild isometric tilt for 3D-ish feel
-  camera.lookAt(0,0,0);
+  camera.position.set(10, 12, 10); // true isometric-ish tilt (~45° azimuth, ~40° elevation)
+  camera.lookAt(0, 0, 0);
 
   standardLights(scene);
 
@@ -1449,18 +1449,30 @@ SIMS.slam = function(container){
     segments.push({x0: W,y0:-H,x1: W,y1: H});
     segments.push({x0: W,y0: H,x1:-W,y1: H});
     segments.push({x0:-W,y0: H,x1:-W,y1:-H});
-    for(let k=0; k<6; k++){
+
+    // Generate candidate internal walls, rejecting any that come too close
+    // to the robot spawn or the four patrol waypoints.
+    const protect = [[0,0], ...waypoints];
+    const CLEAR = 0.9;
+    let tries = 0;
+    while(segments.length < 10 && tries++ < 80){
+      let cand;
       if(Math.random()<0.5){
-        const y = (Math.random()-0.5)*2*(H-1.5);
+        const y  = (Math.random()-0.5)*2*(H-1.5);
         const cx = (Math.random()-0.5)*2*(W-2.5);
-        const L = 1.4 + Math.random()*2.6;
-        segments.push({x0:cx-L/2,y0:y,x1:cx+L/2,y1:y});
+        const L  = 1.4 + Math.random()*2.6;
+        cand = {x0:cx-L/2, y0:y, x1:cx+L/2, y1:y};
       } else {
-        const x = (Math.random()-0.5)*2*(W-1.5);
+        const x  = (Math.random()-0.5)*2*(W-1.5);
         const cy = (Math.random()-0.5)*2*(H-2);
-        const L = 1.2 + Math.random()*2;
-        segments.push({x0:x,y0:cy-L/2,x1:x,y1:cy+L/2});
+        const L  = 1.2 + Math.random()*2;
+        cand = {x0:x, y0:cy-L/2, x1:x, y1:cy+L/2};
       }
+      let ok = true;
+      for(const p of protect){
+        if(distPointSeg(p[0], p[1], cand).d < CLEAR){ ok = false; break; }
+      }
+      if(ok) segments.push(cand);
     }
     rebuildWalls();
     resetMap();
@@ -1475,9 +1487,9 @@ SIMS.slam = function(container){
     for(const s of segments){
       const dx = s.x1 - s.x0, dy = s.y1 - s.y0;
       const L = Math.hypot(dx, dy);
-      const geo = new THREE.BoxGeometry(L, 0.55, 0.14);
+      const geo = new THREE.BoxGeometry(L, 0.38, 0.14);
       const m = new THREE.Mesh(geo, mat);
-      m.position.set((s.x0+s.x1)/2, 0.275, (s.y0+s.y1)/2);
+      m.position.set((s.x0+s.x1)/2, 0.19, (s.y0+s.y1)/2);
       m.rotation.y = -Math.atan2(dy, dx);
       m.castShadow = true; m.receiveShadow = true;
       wallGroup.add(m);
@@ -1497,6 +1509,42 @@ SIMS.slam = function(container){
       if(t >= 0 && t < best && u >= 0 && u <= 1) best = t;
     }
     return best;
+  }
+
+  // ---- wall collision helpers
+  const ROBOT_R = 0.32;          // physical robot radius
+  const WALL_PAD = 0.08;          // wall half-thickness (geometry) + slack
+
+  // Closest-point distance from (px, py) to segment s
+  function distPointSeg(px, py, s){
+    const vx = s.x1 - s.x0, vy = s.y1 - s.y0;
+    const L2 = vx*vx + vy*vy;
+    let t = ((px - s.x0)*vx + (py - s.y0)*vy) / Math.max(1e-9, L2);
+    t = Math.max(0, Math.min(1, t));
+    const cx = s.x0 + t*vx, cy = s.y0 + t*vy;
+    return { d: Math.hypot(px - cx, py - cy), cx, cy };
+  }
+
+  // True if the circular robot at (px,py) overlaps any wall (+ its half-thickness)
+  function inCollision(px, py){
+    const clear = ROBOT_R + WALL_PAD;
+    for(const s of segments) if(distPointSeg(px, py, s).d < clear) return true;
+    return false;
+  }
+
+  // Sum repulsive vector from every nearby wall (nearest-point normal, 1/d falloff)
+  function wallRepulse(px, py, lookahead){
+    let fx = 0, fy = 0;
+    for(const s of segments){
+      const q = distPointSeg(px, py, s);
+      if(q.d > lookahead) continue;
+      const nx = (px - q.cx), ny = (py - q.cy);
+      const L = Math.max(0.01, Math.hypot(nx, ny));
+      const strength = (lookahead - q.d) / lookahead;   // 0..1
+      fx += (nx / L) * strength;
+      fy += (ny / L) * strength;
+    }
+    return { fx, fy };
   }
 
   // ---- occupancy grid (log-odds)
@@ -1691,16 +1739,46 @@ SIMS.slam = function(container){
   // ---- sim steps
   let step = 0, resamples = 0;
 
+  let stuckTimer = 0;
+
   function driveWaypoint(dt){
     const wp = waypoints[wpI];
-    const dx = wp[0] - robot.x, dy = wp[1] - robot.y;
-    if(Math.hypot(dx, dy) < 0.45) wpI = (wpI + 1) % waypoints.length;
+    const gx = wp[0] - robot.x, gy = wp[1] - robot.y;
+    const gd = Math.hypot(gx, gy);
+    if(gd < 0.5){ wpI = (wpI + 1) % waypoints.length; stuckTimer = 0; }
+
+    // desired heading = goal direction + repulsion from nearby walls
+    const REPEL_R = 1.4, REPEL_K = 2.4;
+    const rep = wallRepulse(robot.x, robot.y, REPEL_R);
+    const dx = (gx / Math.max(0.001, gd)) + rep.fx * REPEL_K;
+    const dy = (gy / Math.max(0.001, gd)) + rep.fy * REPEL_K;
     const want = Math.atan2(dy, dx);
-    const dth = wrap(want - robot.th);
-    robot.w = Math.max(-1.6, Math.min(1.6, dth * 2.4));
-    robot.v = 0.6 + Math.max(0, Math.cos(dth)) * 0.7;
-    robot.x += Math.cos(robot.th) * robot.v * dt;
-    robot.y += Math.sin(robot.th) * robot.v * dt;
+    const dth  = wrap(want - robot.th);
+
+    robot.w = Math.max(-2.0, Math.min(2.0, dth * 2.6));
+    robot.v = 0.5 + Math.max(0, Math.cos(dth)) * 0.7;
+
+    // Candidate next pose; reject if it would enter a wall
+    const nx = robot.x + Math.cos(robot.th) * robot.v * dt;
+    const ny = robot.y + Math.sin(robot.th) * robot.v * dt;
+    if(!inCollision(nx, ny)){
+      robot.x = nx; robot.y = ny;
+      stuckTimer = 0;
+    } else {
+      // blocked — try sliding along each world axis independently
+      const nx2 = robot.x + Math.cos(robot.th) * robot.v * dt;
+      const ny2 = robot.y;
+      if(!inCollision(nx2, ny2)){ robot.x = nx2; }
+      else {
+        const nx3 = robot.x;
+        const ny3 = robot.y + Math.sin(robot.th) * robot.v * dt;
+        if(!inCollision(nx3, ny3)) robot.y = ny3;
+      }
+      robot.v = 0;
+      stuckTimer += dt;
+      // if we've been pinned to a wall for >1.5 s, skip to the next waypoint
+      if(stuckTimer > 1.5){ wpI = (wpI + 1) % waypoints.length; stuckTimer = 0; }
+    }
     robot.th = wrap(robot.th + robot.w * dt);
   }
 
@@ -1909,7 +1987,7 @@ SIMS.slam = function(container){
   resizeObserver(container, (w, h) => {
     renderer.setSize(w, h, false);
     camera = ortho();
-    camera.position.set(3, 16, 3); camera.lookAt(0,0,0);
+    camera.position.set(10, 12, 10); camera.lookAt(0, 0, 0);
   });
 
   return {
