@@ -170,27 +170,43 @@ SIMS.hero = function(container){
   const raycaster = new THREE.Raycaster();
   const tgtWorld = new THREE.Vector3(2, 2, 0);
 
-  // simple 2-link CCD on j2..j5 in XY plane for pleasing motion
-  // For hero we just use a heuristic: aim the base, tilt the arm to reach.
+  // 2R IK in the yaw-aligned (Y, Z) plane of j2's local frame.
+  // Chain: j1 yaw (Y) → j2 shoulder pitch (X) → j3 elbow pitch (X).
+  // Upper arm along +Y of j2 (length LA), forearm along +Y of j3 (length LB).
+  // Positive X-rotation of j2 tilts the arm from +Y toward +Z — i.e. "forward"
+  // in the post-yaw frame. Elbow-up config keeps the elbow on the upper side
+  // of the shoulder→wrist line.
   const L1 = 1.4, L2 = 1.1, L3 = 0.7;
+  const J2_WORLD_Y = 0.44;  // j1(0.14) + j2.position.y(0.3)
 
-  function solveAngles(dx, dy){
-    // base yaw towards target x,z
-    const yaw = Math.atan2(dx.x, dx.z);
-    // planar distance r in the yaw plane
-    const r = Math.sqrt(dx.x*dx.x + dx.z*dx.z);
-    const h = dx.y - 0.44; // from j2 origin
-    const d = Math.min(Math.sqrt(r*r + h*h), L1 + L2 + L3 - 0.1);
-    // two-link IK using L1+L3 combined
-    const La = L1;
-    const Lb = L2 + L3;
-    const cos2 = Math.max(-1, Math.min(1, (d*d - La*La - Lb*Lb)/(2*La*Lb)));
-    const a2 = Math.acos(cos2);
-    const a1 = Math.atan2(h, r) - Math.atan2(Lb*Math.sin(a2), La + Lb*Math.cos(a2));
-    return { yaw, a1, a2 };
+  function solveAngles(target){
+    const yaw = Math.atan2(target.x, target.z);
+    const R = Math.hypot(target.x, target.z);         // planar reach in post-yaw frame
+    const H = target.y - J2_WORLD_Y;                   // height above shoulder pivot
+    const LA = L1, LB = L2 + L3;                       // combine forearm + wrist visually
+    const REACH_MAX = LA + LB - 0.08;
+    // clamp to reachable sphere around the shoulder
+    let d = Math.hypot(R, H);
+    const clamped = d > REACH_MAX;
+    if(clamped){
+      const s = REACH_MAX / d;
+      d = REACH_MAX;
+    }
+    const d2 = d * d;
+    // law of cosines — elbow interior from straight, β ∈ [0, π], positive = bent
+    let cosBeta = (d2 - LA*LA - LB*LB) / (2 * LA * LB);
+    cosBeta = Math.max(-1, Math.min(1, cosBeta));
+    const beta = Math.acos(cosBeta);
+    // angle of the hand vector p = (LA + LB cosβ, LB sinβ) from +Y in j2-local
+    const angleP = Math.atan2(LB * Math.sin(beta), LA + LB * cosBeta);
+    // target angle from +Y in j2-local — note H is along +Y, R along +Z
+    const angleT = Math.atan2(R, H);
+    // shoulder tilt α chosen so rotating p by α lands it on the target direction
+    const alpha = angleT - angleP;
+    return { yaw, alpha, beta };
   }
 
-  let smoothed = { yaw: 0, a1: 0, a2: 0 };
+  let smoothed = { yaw: 0, alpha: 0, beta: 0 };
 
   const stop = rafLoop((dt, t)=>{
     // project mouse onto Z=0 plane in world
@@ -214,16 +230,16 @@ SIMS.hero = function(container){
     );
     target.position.lerp(mixed, 0.08);
 
-    const ang = solveAngles(target.position, target.position);
-    smoothed.yaw += (ang.yaw - smoothed.yaw)*0.1;
-    smoothed.a1 += (ang.a1 - smoothed.a1)*0.1;
-    smoothed.a2 += (ang.a2 - smoothed.a2)*0.1;
+    const ang = solveAngles(target.position);
+    smoothed.yaw   += (ang.yaw   - smoothed.yaw)*0.1;
+    smoothed.alpha += (ang.alpha - smoothed.alpha)*0.1;
+    smoothed.beta  += (ang.beta  - smoothed.beta)*0.1;
 
     j1.rotation.y = smoothed.yaw;
-    // j2 is shoulder pitch
-    j2.rotation.x = -smoothed.a1;
-    j3.rotation.x = -smoothed.a2;
-    j4.rotation.x = smoothed.a1*0.3;
+    // j2 shoulder pitch, j3 elbow pitch (elbow-up)
+    j2.rotation.x = smoothed.alpha;
+    j3.rotation.x = smoothed.beta;
+    j4.rotation.x = -smoothed.beta*0.25;
     j5.rotation.y = Math.sin(t*0.8)*0.3;
     j6.rotation.z = Math.sin(t*1.2)*0.4;
 
@@ -775,14 +791,25 @@ SIMS.quad = function(container){
     state.pos.add(state.vel.clone().multiplyScalar(dt));
     state.pos.y = Math.max(0.4, state.pos.y);
 
-    // attitude from lateral acceleration (banked turns)
-    const bankZ = -state.vel.x * 0.18;
-    const bankX = state.vel.z * 0.18;
-    state.att.z += (bankZ - state.att.z)*0.1;
-    state.att.x += (bankX - state.att.x)*0.1;
-    state.att.y += (Math.atan2(state.vel.x, state.vel.z) - state.att.y)*0.05;
+    // yaw toward velocity with shortest-path wrapping (avoid ±π sign flip)
+    const vhSq = state.vel.x*state.vel.x + state.vel.z*state.vel.z;
+    if(vhSq > 0.04){
+      const yawTarget = Math.atan2(state.vel.x, state.vel.z);
+      let dyaw = yawTarget - state.att.y;
+      dyaw = Math.atan2(Math.sin(dyaw), Math.cos(dyaw));
+      state.att.y += dyaw * 0.08;
+    }
+    // bank in the body frame so pitch/roll don't fight yaw
+    const cy = Math.cos(state.att.y), sy = Math.sin(state.att.y);
+    const vForward = state.vel.x*sy + state.vel.z*cy;
+    const vRight   = state.vel.x*cy - state.vel.z*sy;
+    const pitchTarget = vForward * 0.12;
+    const rollTarget  = -vRight * 0.14;
+    state.att.x += (pitchTarget - state.att.x) * 0.1;
+    state.att.z += (rollTarget  - state.att.z) * 0.1;
 
     quad.position.copy(state.pos);
+    quad.rotation.order = 'YXZ';
     quad.rotation.set(state.att.x, state.att.y, state.att.z);
   }
 
@@ -838,405 +865,542 @@ SIMS.quad = function(container){
   };
 };
 
+
 // ==================================================
-// Isometric manipulator on table with IK to draggable target
+// Isometric manipulator — 6-DOF autonomous pick-and-place
+//
+// Chain: base yaw (Y) → shoulder pitch (Z) → elbow ROLL (Y) →
+//        elbow pitch (Z) → wrist pitch (Z) → wrist roll (Y) → grab point
+//
+// Reachable pick/place poses are generated via rejection sampling on
+// forward kinematics, with q_pitch3 = π − q_pitch1 − q_pitch2 forcing the
+// gripper to point straight down. The elbow-roll joint (q_er) is driven
+// cosmetically during transit phases to showcase the extra DOF without
+// breaking the reach sampler.
 // ==================================================
 SIMS.manip = function(container){
   const scene = new THREE.Scene();
-  const rect = container.getBoundingClientRect();
   const renderer = makeRenderer(container);
-  renderer.setSize(rect.width, rect.height, false);
 
-  // isometric ortho camera
-  const cam = () => {
+  // isometric orthographic — slightly higher angle than reference to show base
+  const SZ = 12;
+  const makeCam = () => {
     const r = container.getBoundingClientRect();
-    const aspect = r.width/r.height;
-    const sz = 6;
-    return new THREE.OrthographicCamera(-sz*aspect/2, sz*aspect/2, sz/2, -sz/2, -50, 50);
+    const aspect = r.width / r.height;
+    return new THREE.OrthographicCamera(-SZ*aspect/2, SZ*aspect/2, SZ/2, -SZ/2, -60, 60);
   };
-  let camera = cam();
-  camera.position.set(8, 8, 8);
-  camera.lookAt(0, 1, 0);
+  let camera = makeCam();
+  camera.position.set(10, 9, 10);
+  camera.lookAt(0, 1.2, 0);
 
-  standardLights(scene);
+  // --- lights: match the warm paper scene ---
+  scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+  const key = new THREE.DirectionalLight(0xfff5d8, 0.85);
+  key.position.set(6, 10, 4);
+  key.castShadow = true;
+  key.shadow.mapSize.set(2048, 2048);
+  key.shadow.camera.left = -8; key.shadow.camera.right = 8;
+  key.shadow.camera.top = 8; key.shadow.camera.bottom = -8;
+  key.shadow.bias = -0.0005;
+  scene.add(key);
+  const fill = new THREE.DirectionalLight(0xe8ecd0, 0.3);
+  fill.position.set(-5, 5, -4);
+  scene.add(fill);
 
-  // table
-  const table = new THREE.Group();
-  const top = new THREE.Mesh(
-    new THREE.BoxGeometry(4.2, 0.2, 2.8),
-    new THREE.MeshStandardMaterial({ color: C.bg2 })
-  );
-  top.position.y = 1.0; top.castShadow = true; top.receiveShadow = true;
-  table.add(top);
-  const topRim = new THREE.Mesh(
-    new THREE.BoxGeometry(4.2+0.06, 0.02, 2.8+0.06),
-    new THREE.MeshBasicMaterial({ color: C.ink })
-  );
-  topRim.position.y = 1.12; table.add(topRim);
-
-  [[-2,1,-1.2], [2,1,-1.2], [-2,1,1.2], [2,1,1.2]].forEach(([x,y,z])=>{
-    const leg = new THREE.Mesh(
-      new THREE.BoxGeometry(0.14, 1.0, 0.14),
-      new THREE.MeshStandardMaterial({ color: C.ink })
-    );
-    leg.position.set(x, y-0.5, z); leg.castShadow = true;
-    table.add(leg);
-  });
-  scene.add(table);
-
-  // ground (shadow catcher)
-  const ground = new THREE.Mesh(
-    new THREE.PlaneGeometry(30, 30),
-    new THREE.MeshStandardMaterial({ color: C.bg, roughness: 1 })
-  );
-  ground.rotation.x = -Math.PI/2; ground.receiveShadow = true;
-  scene.add(ground);
-
-  // grid on table surface
-  const gh = new THREE.GridHelper(4, 8, C.hair, C.hair);
-  gh.position.y = 1.101; scene.add(gh);
-  gh.scale.z = 2.8/4;
+  // --- link lengths (longer, slimmer than before) ---
+  const L1 = 2.0, L2 = 1.6, L3 = 0.7;
+  const GRAB_OFF = 0.35;
 
   // ============================================================
-  // Arm: rotating base (j0) + shoulder pitch (j1) + elbow pitch (j2) + wrist pitch (j3) + gripper
-  //
-  // Convention: base axis = Y. In j1 local frame, arm "forward" is +Z and "up" is +Y.
-  // Planar 2R IK solved in (r, h) where r is radial distance in XZ from base, h is height
-  // above shoulder pivot. Wrist is commanded to keep end-effector pointing straight down.
+  //  WORLD SURFACE
   // ============================================================
-  const base = new THREE.Group();
-  const BASE_POS = new THREE.Vector3(-1.4, 1.1, 0);
-  base.position.copy(BASE_POS);
-  scene.add(base);
+  // Cream paper table surface (matches site bg-2), with thin ink outline.
+  const tableGroup = new THREE.Group();
+  scene.add(tableGroup);
 
-  const mat = (c)=> new THREE.MeshStandardMaterial({ color: c, roughness:0.6, metalness:0.1});
-  function bx(w,h,d,m){ const g=new THREE.Mesh(new THREE.BoxGeometry(w,h,d), m); g.castShadow=true; g.receiveShadow=true; return g;}
-  function cy(r,h,m){ const g=new THREE.Mesh(new THREE.CylinderGeometry(r,r,h,20), m); g.castShadow=true; return g;}
+  const topThick = 0.12;
+  const topW = 14, topD = 10;
+  const topMat = new THREE.MeshStandardMaterial({ color: C.bg2, roughness: 0.95, metalness: 0 });
+  const top = new THREE.Mesh(new THREE.BoxGeometry(topW, topThick, topD), topMat);
+  top.position.y = -topThick/2;
+  top.receiveShadow = true;
+  tableGroup.add(top);
+  // ink outline on top face
+  const topOutline = new THREE.LineSegments(
+    new THREE.EdgesGeometry(new THREE.BoxGeometry(topW, topThick, topD)),
+    new THREE.LineBasicMaterial({ color: C.ink })
+  );
+  topOutline.position.copy(top.position);
+  tableGroup.add(topOutline);
 
-  // base plate
-  const basePuck = cy(0.22, 0.14, mat(C.forest)); basePuck.position.y = 0.07; base.add(basePuck);
+  // subtle grid on the table top — hair-weight lines
+  const grid = new THREE.GridHelper(14, 14, C.hair, C.hair);
+  grid.material.opacity = 0.35;
+  grid.material.transparent = true;
+  grid.position.y = 0.001;
+  tableGroup.add(grid);
 
-  // j0 yaw pivot (rotates around Y)
-  const j0 = new THREE.Group(); base.add(j0); j0.position.y = 0.14;
-  const j0m = cy(0.14, 0.18, mat(C.yellow)); j0m.position.y = 0.09; j0.add(j0m);
+  // Thin ink tracks at ±center (blueprint-style registration marks)
+  function regLine(x1,z1,x2,z2, color=C.hair){
+    const g = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(x1, 0.002, z1),
+      new THREE.Vector3(x2, 0.002, z2),
+    ]);
+    return new THREE.Line(g, new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.5 }));
+  }
+  tableGroup.add(regLine(-6, 0, 6, 0));
+  tableGroup.add(regLine(0, -4, 0, 4));
 
-  // j1 shoulder pitch (rotates around X) -- upper arm extends forward along +Z when angle positive
-  const SHOULDER_H = 0.18;
-  const j1 = new THREE.Group(); j0.add(j1); j1.position.y = SHOULDER_H;
-  // Upper arm = link from j1 forward to j2, length L1. Draw along +Z in j1's local frame.
-  const L1 = 0.8;
-  const upper = bx(0.12, 0.12, L1, mat(C.ink)); upper.position.z = L1/2; j1.add(upper);
+  // Corner registration ticks
+  function cornerTick(x, z){
+    const g = new THREE.Group();
+    g.add(regLine(-0.35, 0, 0.35, 0, C.ink));
+    g.add(regLine(0, -0.35, 0, 0.35, C.ink));
+    g.position.set(x, 0, z);
+    return g;
+  }
+  tableGroup.add(cornerTick(-5.5, -3.5));
+  tableGroup.add(cornerTick(5.5, -3.5));
+  tableGroup.add(cornerTick(-5.5, 3.5));
+  tableGroup.add(cornerTick(5.5, 3.5));
 
-  // j2 elbow (rotates around X), located at end of upper arm
-  const j2 = new THREE.Group(); j1.add(j2); j2.position.z = L1;
-  const j2m = cy(0.1, 0.14, mat(C.yellow)); j2m.rotation.z = Math.PI/2; j2.add(j2m);
-  // forearm length L2
-  const L2 = 0.65;
-  const fore = bx(0.1, 0.1, L2, mat(C.ink)); fore.position.z = L2/2; j2.add(fore);
-
-  // j3 wrist (rotates around X), at end of forearm
-  const j3 = new THREE.Group(); j2.add(j3); j3.position.z = L2;
-  const j3m = cy(0.08, 0.1, mat(C.yellow)); j3m.rotation.z = Math.PI/2; j3.add(j3m);
-  // gripper palm (pointing along +Z in wrist frame, offset = L3)
-  const L3 = 0.22;
-  const palm = bx(0.14, 0.14, L3, mat(C.ink)); palm.position.z = L3/2; j3.add(palm);
-  // two fingers that open along X
-  const FINGER_LEN = 0.14;
-  const fingerMat = mat(C.red);
-  const g1 = bx(0.04, 0.12, FINGER_LEN, fingerMat); g1.position.set(0.08, 0, L3 + FINGER_LEN/2); j3.add(g1);
-  const g2 = bx(0.04, 0.12, FINGER_LEN, fingerMat); g2.position.set(-0.08, 0, L3 + FINGER_LEN/2); j3.add(g2);
-
-  // end-effector reference point (tip center between fingers)
-  const EE_OFFSET_Z = L3 + FINGER_LEN;
-  const eeMarker = new THREE.Object3D();
-  eeMarker.position.z = EE_OFFSET_Z;
-  j3.add(eeMarker);
-
-  // target cube
-  const CUBE_H = 0.22;
-  const TABLE_TOP_Y = 1.1 + 0.1; // table top face y
-  const target = new THREE.Mesh(
+  // ============================================================
+  //  PAYLOAD (yellow cube) — shaped like a signal marker
+  // ============================================================
+  const CUBE_H = 0.34;
+  const objGroup = new THREE.Group();
+  scene.add(objGroup);
+  const objMesh = new THREE.Mesh(
     new THREE.BoxGeometry(CUBE_H, CUBE_H, CUBE_H),
-    mat(C.yellow)
+    new THREE.MeshLambertMaterial({ color: C.yellow })
   );
-  target.castShadow = true;
-  target.position.set(0.6, TABLE_TOP_Y + CUBE_H/2, 0.4);
-  scene.add(target);
-  const bullseye = new THREE.Mesh(
-    new THREE.RingGeometry(0.06, 0.09, 24),
+  objMesh.castShadow = true;
+  objMesh.receiveShadow = true;
+  objGroup.add(objMesh);
+  const objEdges = new THREE.LineSegments(
+    new THREE.EdgesGeometry(objMesh.geometry),
+    new THREE.LineBasicMaterial({ color: C.ink })
+  );
+  objGroup.add(objEdges);
+  // bullseye on top
+  const bulls = new THREE.Mesh(
+    new THREE.RingGeometry(0.06, 0.09, 32),
     new THREE.MeshBasicMaterial({ color: C.ink, side: THREE.DoubleSide })
   );
-  bullseye.rotation.x = -Math.PI/2;
-  bullseye.position.y = CUBE_H/2 + 0.002;
-  target.add(bullseye);
+  bulls.rotation.x = -Math.PI/2;
+  bulls.position.y = CUBE_H/2 + 0.001;
+  objGroup.add(bulls);
 
-  // drop zone (where we place the cube when holding)
-  const dropZone = new THREE.Mesh(
-    new THREE.RingGeometry(0.16, 0.2, 32),
-    new THREE.MeshBasicMaterial({ color: C.forest, transparent: true, opacity: 0.6, side: THREE.DoubleSide })
+  // ============================================================
+  //  DROP ZONE (outlined pad)
+  // ============================================================
+  const binGroup = new THREE.Group();
+  scene.add(binGroup);
+  // subtle filled pad
+  const padPlane = new THREE.Mesh(
+    new THREE.PlaneGeometry(1.6, 1.6),
+    new THREE.MeshBasicMaterial({ color: C.forest, transparent: true, opacity: 0.08, side: THREE.DoubleSide })
   );
-  dropZone.rotation.x = -Math.PI/2;
-  dropZone.position.set(-0.4, TABLE_TOP_Y + 0.002, -0.7);
-  scene.add(dropZone);
-
-  // static clutter
-  function clutter(pos, col, sh){
-    const geo = sh==="sphere" ? new THREE.SphereGeometry(0.11, 16, 16) :
-                sh==="cyl" ? new THREE.CylinderGeometry(0.09, 0.09, 0.2, 16) :
-                new THREE.BoxGeometry(0.18,0.18,0.18);
-    const m = new THREE.Mesh(geo, new THREE.MeshStandardMaterial({ color: col }));
-    m.position.copy(pos); m.castShadow = true; scene.add(m);
+  padPlane.rotation.x = -Math.PI/2;
+  padPlane.position.y = 0.002;
+  binGroup.add(padPlane);
+  // outlined square
+  const padOutline = new THREE.LineLoop(
+    new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(-0.8, 0.003, -0.8),
+      new THREE.Vector3( 0.8, 0.003, -0.8),
+      new THREE.Vector3( 0.8, 0.003,  0.8),
+      new THREE.Vector3(-0.8, 0.003,  0.8),
+    ]),
+    new THREE.LineBasicMaterial({ color: C.ink })
+  );
+  binGroup.add(padOutline);
+  // inner yellow bracket marks at corners
+  function bracket(sx, sz){
+    const g = new THREE.Group();
+    const m = new THREE.LineBasicMaterial({ color: C.yellow });
+    const a = new THREE.Line(new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(0, 0.004, 0), new THREE.Vector3(0.2 * sx, 0.004, 0),
+    ]), m);
+    const b = new THREE.Line(new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(0, 0.004, 0), new THREE.Vector3(0, 0.004, 0.2 * sz),
+    ]), m);
+    g.add(a); g.add(b);
+    g.position.set(-0.6 * sx, 0, -0.6 * sz);
+    return g;
   }
-  clutter(new THREE.Vector3(1.6, TABLE_TOP_Y + 0.1, -0.3), C.moss, "sphere");
-  clutter(new THREE.Vector3(0.2, TABLE_TOP_Y + 0.1, -0.8), C.forest, "cyl");
+  binGroup.add(bracket(1, 1));
+  binGroup.add(bracket(-1, 1));
+  binGroup.add(bracket(1, -1));
+  binGroup.add(bracket(-1, -1));
 
   // ============================================================
-  // IK: given a desired end-effector world position, solve j0 yaw
-  // and 2R angles (j1, j2) such that the tip reaches it with wrist
-  // pointing straight down.
-  //
-  // In j0's local frame (after yaw), j1 is at height SHOULDER_H above the base,
-  // and the arm extends in the r-h plane where r = sqrt(x^2 + z^2) from base.
-  // With wrist pointing down, j3 origin = target + (0, EE_OFFSET_Z, 0).
-  // So we solve 2R IK to put j3 origin at (r_wrist, h_wrist).
+  //  ROBOT ARM — slim silhouette, ink bodies, yellow details
   // ============================================================
-  const angles = { j0: 0, j1: 0, j2: 0, j3: 0 };
-  const target_angles = { j0: 0, j1: 0.3, j2: -0.6, j3: 0 };
+  const inkMat   = new THREE.MeshLambertMaterial({ color: C.ink });
+  const mossMat  = new THREE.MeshLambertMaterial({ color: C.moss });
+  const yellowMat= new THREE.MeshLambertMaterial({ color: C.yellow });
+  const forestMat= new THREE.MeshLambertMaterial({ color: C.forest });
 
-  function solveIK(worldTarget){
-    // transform to base-local frame
-    const t = worldTarget.clone().sub(BASE_POS);
-    // yaw so arm faces target in XZ
-    const yaw = Math.atan2(t.x, t.z);
-    // wrist-pointing-down offset: wrist origin should be directly above tip by EE_OFFSET_Z
-    const wristX = t.x;
-    const wristY = t.y + EE_OFFSET_Z; // tip points -Y (down), so wrist is above
-    const wristZ = t.z;
-    // radial & height in j1's local frame (j1 origin is at y=SHOULDER_H+BASE_PUCK_TOP above base)
-    const BASE_TOP = 0.14; // basePuck height
-    const r = Math.hypot(wristX, wristZ);
-    const h = wristY - (BASE_TOP + SHOULDER_H);
-    // distance from j1 to wrist
-    let d = Math.hypot(r, h);
-    const reach = L1 + L2 - 0.01;
-    const reachable = d <= reach;
-    if(d > reach) d = reach;
-    // law of cosines: elbow angle (interior)
-    const cosElbow = Math.max(-1, Math.min(1, (L1*L1 + L2*L2 - d*d) / (2*L1*L2)));
-    const elbow = Math.acos(cosElbow); // interior angle at elbow
-    // we want elbow-up => j2 angle is negative (bending back)
-    const j2Angle = -(Math.PI - elbow); // bend inward
-    // shoulder angle: alpha = atan2(h, r) points from j1 to wrist; beta is triangle interior at shoulder
-    const alpha = Math.atan2(h, r);
-    const cosBeta = Math.max(-1, Math.min(1, (L1*L1 + d*d - L2*L2) / (2*L1*d)));
-    const beta = Math.acos(cosBeta);
-    // The arm's neutral (j1=0) is along +Z (horizontal forward). To reach angle `alpha` above horizontal
-    // with elbow up, shoulder pitch j1 = alpha + beta. But because we're rotating around X,
-    // a positive j1 rotation tips the arm DOWN (since +Z rotates toward -Y under +X rotation).
-    // So use j1 = -(alpha + beta) to tip up.
-    const j1Angle = -(alpha + beta);
-    // wrist must total to -PI/2 (pointing down = along -Y in world = -Y in shoulder frame after arm bends)
-    // Sum of pitches after j3 = j1 + j2 + j3. We want j1+j2+j3 = -PI/2.
-    const j3Angle = -Math.PI/2 - j1Angle - j2Angle;
-    return { j0: yaw, j1: j1Angle, j2: j2Angle, j3: j3Angle, reachable };
+  function castBox(w,h,d,m){
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(w,h,d), m);
+    mesh.castShadow = true; mesh.receiveShadow = true;
+    return mesh;
+  }
+  function linkMesh(length, cross, bodyMat, edgeColor){
+    const g = new THREE.Group();
+    const body = castBox(cross, length, cross, bodyMat);
+    body.position.y = length/2;
+    g.add(body);
+    const edges = new THREE.LineSegments(
+      new THREE.EdgesGeometry(body.geometry),
+      new THREE.LineBasicMaterial({ color: edgeColor })
+    );
+    edges.position.copy(body.position);
+    g.add(edges);
+    return g;
+  }
+  function jointPuck(radius, height, color, accentColor){
+    const g = new THREE.Group();
+    const m = new THREE.Mesh(
+      new THREE.CylinderGeometry(radius, radius, height, 32),
+      new THREE.MeshLambertMaterial({ color })
+    );
+    m.castShadow = true; m.rotation.z = Math.PI/2; // horizontal pivot (visually "pin")
+    g.add(m);
+    const ring = new THREE.LineSegments(
+      new THREE.EdgesGeometry(m.geometry),
+      new THREE.LineBasicMaterial({ color: accentColor, transparent: true, opacity: 0.8 })
+    );
+    ring.rotation.copy(m.rotation);
+    g.add(ring);
+    return g;
+  }
+
+  // -- base (yaw Y) --
+  const base = new THREE.Group();
+  scene.add(base);
+  // plinth
+  const plinth = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.55, 0.7, 0.25, 48),
+    new THREE.MeshLambertMaterial({ color: C.forest })
+  );
+  plinth.position.y = 0.125;
+  plinth.castShadow = true;
+  plinth.receiveShadow = true;
+  base.add(plinth);
+  const plinthRing = new THREE.LineSegments(
+    new THREE.EdgesGeometry(plinth.geometry),
+    new THREE.LineBasicMaterial({ color: C.ink, transparent: true, opacity: 0.6 })
+  );
+  plinthRing.position.copy(plinth.position);
+  base.add(plinthRing);
+  // yellow bezel ring on top of plinth
+  const bezel = new THREE.Mesh(
+    new THREE.TorusGeometry(0.5, 0.025, 8, 48),
+    yellowMat
+  );
+  bezel.rotation.x = Math.PI/2;
+  bezel.position.y = 0.255;
+  base.add(bezel);
+  // yoke column that holds the shoulder joint
+  const yoke = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.2, 0.24, 0.55, 24),
+    mossMat
+  );
+  yoke.position.y = 0.525;
+  yoke.castShadow = true;
+  base.add(yoke);
+
+  // -- shoulder pitch (joint1, Z) --
+  const joint1 = new THREE.Group();
+  joint1.position.set(0, 0.8, 0);
+  base.add(joint1);
+  joint1.add(jointPuck(0.22, 0.36, C.ink, C.yellow));
+  const upper = linkMesh(L1, 0.22, inkMat, C.yellow);
+  joint1.add(upper);
+
+  // -- elbow ROLL (new DOF, around Y of upper-arm frame) --
+  // inserted *before* the pitch joint at the same position so the elbow pivot
+  // stays at (0, L1, 0) regardless of roll value.
+  const elbowRoll = new THREE.Group();
+  elbowRoll.position.set(0, 0, 0);
+  joint1.add(elbowRoll);
+
+  // -- elbow pitch (joint2, Z) --
+  const joint2 = new THREE.Group();
+  joint2.position.set(0, L1, 0);
+  elbowRoll.add(joint2);
+  joint2.add(jointPuck(0.18, 0.32, C.ink, C.yellow));
+  const fore = linkMesh(L2, 0.18, inkMat, C.yellow);
+  joint2.add(fore);
+
+  // -- wrist pitch (joint3, Z) --
+  const joint3 = new THREE.Group();
+  joint3.position.set(0, L2, 0);
+  joint2.add(joint3);
+  joint3.add(jointPuck(0.14, 0.28, C.ink, C.yellow));
+  const wristArm = linkMesh(L3, 0.14, inkMat, C.yellow);
+  joint3.add(wristArm);
+
+  // -- wrist roll (effector, Y) --
+  const effector = new THREE.Group();
+  effector.position.set(0, L3, 0);
+  joint3.add(effector);
+
+  // palm: wider, flatter, moss with yellow edges
+  const palm = castBox(0.48, 0.12, 0.56, mossMat);
+  palm.position.y = 0.06;
+  effector.add(palm);
+  const palmEdges = new THREE.LineSegments(
+    new THREE.EdgesGeometry(palm.geometry),
+    new THREE.LineBasicMaterial({ color: C.yellow })
+  );
+  palmEdges.position.copy(palm.position);
+  effector.add(palmEdges);
+
+  // fingertip sockets (decorative ink pins)
+  for(const sx of [-0.18, 0.18]){
+    for(const sz of [-0.22, 0.22]){
+      const pin = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.018, 0.018, 0.03, 12),
+        inkMat
+      );
+      pin.position.set(sx, 0.135, sz);
+      effector.add(pin);
+    }
+  }
+
+  // grippers — open/close along Z. Slim ink fingers w/ yellow tip accent.
+  function makeFinger(){
+    const g = new THREE.Group();
+    const body = castBox(0.09, 0.42, 0.05, inkMat);
+    body.position.y = 0.21;
+    g.add(body);
+    const tip = castBox(0.11, 0.06, 0.07, yellowMat);
+    tip.position.y = 0.42 + 0.03;
+    g.add(tip);
+    const edges = new THREE.LineSegments(
+      new THREE.EdgesGeometry(body.geometry),
+      new THREE.LineBasicMaterial({ color: C.yellow, transparent: true, opacity: 0.7 })
+    );
+    edges.position.copy(body.position);
+    g.add(edges);
+    return g;
+  }
+  const gripLeft = makeFinger();
+  gripLeft.position.set(0, 0.12, 0.28);
+  effector.add(gripLeft);
+  const gripRight = makeFinger();
+  gripRight.position.set(0, 0.12, -0.28);
+  effector.add(gripRight);
+
+  // tool-center-point (grab point) between the fingers
+  const grabPoint = new THREE.Object3D();
+  grabPoint.position.set(0, 0.42 + 0.08, 0);  // at finger tips' mid-height
+  effector.add(grabPoint);
+
+  // Small "laser pointer" visual under the gripper — just a yellow line
+  const laserGeom = new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(0, 0, 0),
+    new THREE.Vector3(0, 0.3, 0),
+  ]);
+  const laser = new THREE.Line(
+    laserGeom,
+    new THREE.LineBasicMaterial({ color: C.yellow, transparent: true, opacity: 0.6 })
+  );
+  laser.position.set(0, 0.48, 0);
+  effector.add(laser);
+
+  // ============================================================
+  // FORWARD KINEMATICS (now 6-DOF)
+  // q = [yaw, shoulder_pitch, elbow_roll, elbow_pitch, wrist_pitch, wrist_roll]
+  //      q0   q1              q_er         q2           q3            q4
+  // GRAB_OFF is applied along the effector's +Y (between fingers).
+  // ============================================================
+  function computeFK(q0, q1, q_er, q2, q3, q4){
+    const dB = new THREE.Object3D();
+    const d1 = new THREE.Object3D(); d1.position.set(0, 0.8, 0); dB.add(d1);
+    const dRoll = new THREE.Object3D(); dRoll.position.set(0, 0, 0); d1.add(dRoll);
+    const d2 = new THREE.Object3D(); d2.position.set(0, L1, 0); dRoll.add(d2);
+    const d3 = new THREE.Object3D(); d3.position.set(0, L2, 0); d2.add(d3);
+    const dE = new THREE.Object3D(); dE.position.set(0, L3, 0); d3.add(dE);
+    const dG = new THREE.Object3D(); dG.position.set(0, GRAB_OFF + 0.15, 0); dE.add(dG);
+    dB.rotation.y   = q0;
+    d1.rotation.z   = q1;
+    dRoll.rotation.y = q_er;
+    d2.rotation.z   = q2;
+    d3.rotation.z   = q3;
+    dE.rotation.y   = q4;
+    dB.updateMatrixWorld(true);
+    const pos = new THREE.Vector3(); dG.getWorldPosition(pos);
+    const quat = new THREE.Quaternion(); dG.getWorldQuaternion(quat);
+    return { pos, quat };
+  }
+
+  // Sampler: q_er is fixed to 0 during pick/place so the standard
+  // planar reach constraint applies. The longer arm reaches further,
+  // so widen the radial band accordingly.
+  function sampleValidPose(){
+    const MIN_R = 1.4, MAX_R = L1 + L2 + L3 - 0.3;
+    for(let i = 0; i < 800; i++){
+      const q0 = (Math.random() - 0.5) * Math.PI * 1.6;
+      const q1 = Math.random() * Math.PI * 0.35 + 0.1;
+      const q2 = Math.random() * Math.PI * 0.45 + 0.1;
+      const q3 = Math.PI - (q1 + q2);
+      const q4 = (Math.random() - 0.5) * Math.PI;
+      const { pos, quat } = computeFK(q0, q1, 0, q2, q3, q4);
+      const rad = Math.hypot(pos.x, pos.z);
+      if(pos.y > 0.12 && pos.y < 0.24 && rad > MIN_R && rad < MAX_R){
+        return { angles: [q0, q1, 0, q2, q3, q4], pos, quat };
+      }
+    }
+    // fallback at a known-reachable pose
+    const q1 = 0.5, q2 = 0.5, q3 = Math.PI - 1.0;
+    const { pos, quat } = computeFK(0, q1, 0, q2, q3, 0);
+    return { angles: [0, q1, 0, q2, q3, 0], pos, quat };
+  }
+
+  // Transit pose: same yaw, retract the pitches, add a mild elbow roll sway
+  // (purely cosmetic — shows the extra DOF while the arm is clear of payload).
+  function liftAngles(a, rollPhase){
+    const q0 = a[0];
+    const q1 = Math.max(0.05, a[1] - 0.55);
+    const q2 = Math.max(0.05, a[2] - 0.55);
+    const q3 = Math.PI - (q1 + q2);
+    const q_er = 0.55 * Math.sin(rollPhase);
+    const q4 = a[5];
+    return [q0, q1, q_er, q2, q3, q4];
   }
 
   // ============================================================
-  // Pick-and-place state machine
-  //   IDLE        — arm rests above home
-  //   APPROACH    — move EE above cube (pre-grasp height)
-  //   DESCEND     — lower onto cube
-  //   GRASP       — close fingers, attach cube to gripper
-  //   LIFT        — raise cube up
-  //   MOVE        — carry toward drop zone (pre-place height)
-  //   PLACE       — lower cube to drop zone
-  //   RELEASE     — open fingers, detach cube
-  //   RETREAT     — lift and return home
+  //  SCENE STATE & FSM
   // ============================================================
-  const STATE = {
-    IDLE: "idle", APPROACH: "approach", DESCEND: "descend",
-    GRASP: "grasp", LIFT: "lift", MOVE: "move",
-    PLACE: "place", RELEASE: "release", RETREAT: "retreat",
-  };
-  const fsm = {
-    state: STATE.APPROACH,
+  let poses = { pick: sampleValidPose(), place: sampleValidPose() };
+  function resetScene(){
+    objGroup.position.copy(poses.pick.pos);
+    objGroup.quaternion.copy(poses.pick.quat);
+    binGroup.position.set(poses.place.pos.x, 0, poses.place.pos.z);
+  }
+  resetScene();
+
+  const PHASES = ["REST", "APPROACH", "GRASP", "LIFT", "TRANSIT", "LOWER", "RELEASE"];
+  const st = {
+    phase: 0,
     timer: 0,
+    rollPhase: 0,   // drives the transit elbow-roll sway
+    q: [0, 0.25, 0, 0.25, Math.PI - 0.5, 0], // [q0, q1, q_er, q2, q3, q4]
+    grip: 0.28,
     holding: false,
   };
-  const HOME = new THREE.Vector3(BASE_POS.x + 0.0, TABLE_TOP_Y + 0.7, BASE_POS.z + 0.7);
-  const PRE_GRASP_DZ = 0.28; // height above cube top to hover
-  const gripperOpen = { v: 0.08 };
-  const gripperOpenTarget = { v: 0.08 };
-  // effective EE world position used by IK
-  const eeCmd = new THREE.Vector3().copy(HOME);
+  const GRIP_OPEN = 0.30;
+  const GRIP_CLOSED = 0.15;
 
-  function fsmStep(dt){
-    fsm.timer += dt;
-    const cubeTop = target.position.clone();
-    cubeTop.y = TABLE_TOP_Y + CUBE_H + 0.002; // just above cube top
-    const preGrasp = cubeTop.clone(); preGrasp.y += PRE_GRASP_DZ;
-    const grasp = cubeTop.clone(); grasp.y = TABLE_TOP_Y + CUBE_H*0.55; // around cube middle
-    const dropTop = dropZone.position.clone(); dropTop.y = TABLE_TOP_Y + CUBE_H*0.55;
-    const preDrop = dropTop.clone(); preDrop.y += PRE_GRASP_DZ;
+  function targetsForPhase(){
+    const p = poses;
+    switch(st.phase){
+      case 0: return { q: [0, 0.25, 0, 0.25, Math.PI - 0.5, 0], grip: GRIP_OPEN, speed: 1.0 };
+      case 1: return { q: [...p.pick.angles], grip: GRIP_OPEN, speed: 2.2 };
+      case 2: return { q: [...p.pick.angles], grip: GRIP_CLOSED, speed: 2.0 };
+      case 3: return { q: liftAngles(p.pick.angles, st.rollPhase), grip: GRIP_CLOSED, speed: 2.4 };
+      case 4: return { q: liftAngles(p.place.angles, st.rollPhase), grip: GRIP_CLOSED, speed: 1.8 };
+      case 5: return { q: [...p.place.angles], grip: GRIP_CLOSED, speed: 2.2 };
+      case 6: return { q: [...p.place.angles], grip: GRIP_OPEN, speed: 3.5 };
+      default: return { q: [0, 0.25, 0, 0.25, Math.PI - 0.5, 0], grip: GRIP_OPEN, speed: 1.0 };
+    }
+  }
 
-    let cmd = eeCmd.clone();
-    let nearEnough = (t, tol=0.04)=> eeCmd.distanceTo(t) < tol;
+  function stepFSM(dt){
+    // advance transit-roll clock only while the arm is clear of payload
+    if(st.phase === 3 || st.phase === 4){
+      st.rollPhase += dt * 1.4;
+    }
+    const tgt = targetsForPhase();
+    let err = 0;
+    for(let i = 0; i < 6; i++){
+      st.q[i] += (tgt.q[i] - st.q[i]) * dt * tgt.speed;
+      err += Math.abs(tgt.q[i] - st.q[i]);
+    }
+    st.grip += (tgt.grip - st.grip) * dt * tgt.speed * 2;
+    const gripErr = Math.abs(tgt.grip - st.grip);
 
-    switch(fsm.state){
-      case STATE.IDLE:
-        cmd = HOME;
-        if(fsm.timer > 0.5){ fsm.state = STATE.APPROACH; fsm.timer = 0;}
-        break;
-      case STATE.APPROACH:
-        cmd = preGrasp; gripperOpenTarget.v = 0.09;
-        if(nearEnough(preGrasp, 0.03)){ fsm.state = STATE.DESCEND; fsm.timer = 0;}
-        break;
-      case STATE.DESCEND:
-        cmd = grasp; gripperOpenTarget.v = 0.09;
-        if(nearEnough(grasp, 0.03)){ fsm.state = STATE.GRASP; fsm.timer = 0;}
-        break;
-      case STATE.GRASP:
-        cmd = grasp;
-        gripperOpenTarget.v = 0.04; // close
-        if(fsm.timer > 0.35){ fsm.holding = true; fsm.state = STATE.LIFT; fsm.timer = 0;}
-        break;
-      case STATE.LIFT:
-        cmd = preGrasp; gripperOpenTarget.v = 0.04;
-        if(nearEnough(preGrasp, 0.04)){ fsm.state = STATE.MOVE; fsm.timer = 0;}
-        break;
-      case STATE.MOVE:
-        cmd = preDrop; gripperOpenTarget.v = 0.04;
-        if(nearEnough(preDrop, 0.04)){ fsm.state = STATE.PLACE; fsm.timer = 0;}
-        break;
-      case STATE.PLACE:
-        cmd = dropTop; gripperOpenTarget.v = 0.04;
-        if(nearEnough(dropTop, 0.03)){ fsm.state = STATE.RELEASE; fsm.timer = 0;}
-        break;
-      case STATE.RELEASE:
-        cmd = dropTop; gripperOpenTarget.v = 0.09;
-        if(fsm.timer > 0.3){
-          fsm.holding = false;
-          // detach cube into world at drop zone
-          target.position.set(dropZone.position.x, TABLE_TOP_Y + CUBE_H/2, dropZone.position.z);
-          // choose a new random drop zone for next cycle
-          const dx = (Math.random()-0.5)*1.8;
-          const dz = (Math.random()-0.5)*1.6;
-          dropZone.position.set(dx, TABLE_TOP_Y + 0.002, dz);
-          fsm.state = STATE.RETREAT; fsm.timer = 0;
+    const converged = err < 0.06 && gripErr < 0.02;
+    if(converged){
+      st.timer += dt;
+      const dwell = (st.phase === 2 || st.phase === 6) ? 0.35 : 0.08;
+      if(st.timer > dwell){
+        st.timer = 0;
+        if(st.phase === 2) st.holding = true;
+        if(st.phase === 6){
+          st.holding = false;
+          // leave cube where it was dropped, then spawn new pick/place
+          objGroup.position.copy(poses.place.pos);
+          objGroup.quaternion.copy(poses.place.quat);
+          poses = { pick: sampleValidPose(), place: sampleValidPose() };
+          objGroup.position.copy(poses.pick.pos);
+          objGroup.quaternion.copy(poses.pick.quat);
+          binGroup.position.set(poses.place.pos.x, 0, poses.place.pos.z);
+          st.phase = 0;
+        } else {
+          st.phase += 1;
         }
-        break;
-      case STATE.RETREAT:
-        cmd = preDrop; gripperOpenTarget.v = 0.09;
-        if(nearEnough(preDrop, 0.05)){ fsm.state = STATE.APPROACH; fsm.timer = 0;}
-        break;
-    }
-    // smooth EE command
-    eeCmd.lerp(cmd, Math.min(1, dt * 5.0));
-    // smooth gripper
-    gripperOpen.v += (gripperOpenTarget.v - gripperOpen.v) * Math.min(1, dt * 8.0);
-  }
-
-  // If user is dragging the target, pause the FSM and track directly
-  let userHolding = false;
-  function setToApproachOnRelease(){
-    // When user drops the cube, restart the cycle cleanly
-    fsm.holding = false;
-    fsm.state = STATE.APPROACH;
-    fsm.timer = 0;
-  }
-
-  // Drag target (ONLY when user clicks it — never auto-moves)
-  const raycaster = new THREE.Raycaster();
-  const pointer = new THREE.Vector2();
-  let dragging = false;
-  function updatePointer(e){
-    const r = container.getBoundingClientRect();
-    pointer.x = ((e.clientX - r.left)/r.width)*2 - 1;
-    pointer.y = -(((e.clientY - r.top)/r.height)*2 - 1);
-  }
-  container.addEventListener("pointerdown", (e)=>{
-    updatePointer(e);
-    raycaster.setFromCamera(pointer, camera);
-    const hit = raycaster.intersectObject(target, true);
-    if(hit.length){
-      dragging = true;
-      // if the arm was holding the cube, let user take it
-      fsm.holding = false;
-    }
-  });
-  container.addEventListener("pointermove", (e)=>{
-    if(!dragging) return;
-    updatePointer(e);
-    raycaster.setFromCamera(pointer, camera);
-    const p = new THREE.Vector3();
-    raycaster.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0,1,0), -(TABLE_TOP_Y + CUBE_H/2)), p);
-    if(p){
-      target.position.x = Math.max(-1.85, Math.min(1.85, p.x));
-      target.position.z = Math.max(-1.22, Math.min(1.22, p.z));
-      target.position.y = TABLE_TOP_Y + CUBE_H/2;
-    }
-  });
-  container.addEventListener("pointerup", ()=>{
-    if(dragging){ dragging = false; setToApproachOnRelease(); }
-  });
-  container.addEventListener("pointerleave", ()=>{
-    if(dragging){ dragging = false; setToApproachOnRelease(); }
-  });
-
-  const stop = rafLoop((dt, t)=>{
-    if(!dragging) fsmStep(dt);
-
-    // If arm is holding, cube follows end-effector
-    // We'll set after IK below.
-
-    // Solve IK for current ee command
-    const ik = solveIK(eeCmd);
-    // smooth angles
-    const k = Math.min(1, dt * 6.0);
-    angles.j0 += (ik.j0 - angles.j0) * k;
-    angles.j1 += (ik.j1 - angles.j1) * k;
-    angles.j2 += (ik.j2 - angles.j2) * k;
-    angles.j3 += (ik.j3 - angles.j3) * k;
-
-    j0.rotation.y = angles.j0;
-    j1.rotation.x = angles.j1;
-    j2.rotation.x = angles.j2;
-    j3.rotation.x = angles.j3;
-
-    // gripper open
-    g1.position.x = gripperOpen.v;
-    g2.position.x = -gripperOpen.v;
-
-    // If holding, snap cube to tip
-    if(fsm.holding){
-      const tip = new THREE.Vector3();
-      eeMarker.getWorldPosition(tip);
-      target.position.copy(tip);
-      target.position.y -= CUBE_H/2 * 0.0 - 0.0; // keep at tip
-      // orient cube upright
-      target.rotation.set(0, angles.j0, 0);
+      }
     } else {
-      // not holding — cube is sitting on the table
-      target.position.y = TABLE_TOP_Y + CUBE_H/2;
-      target.rotation.set(0, 0, 0);
+      st.timer = 0;
     }
+  }
 
+  function applyKinematics(){
+    base.rotation.y       = st.q[0];
+    joint1.rotation.z     = st.q[1];
+    elbowRoll.rotation.y  = st.q[2];
+    joint2.rotation.z     = st.q[3];
+    joint3.rotation.z     = st.q[4];
+    effector.rotation.y   = st.q[5];
+    gripLeft.position.z   = st.grip;
+    gripRight.position.z  = -st.grip;
+
+    if(st.holding){
+      const wp = new THREE.Vector3(); grabPoint.getWorldPosition(wp);
+      const wq = new THREE.Quaternion(); grabPoint.getWorldQuaternion(wq);
+      objGroup.position.copy(wp);
+      objGroup.quaternion.copy(wq);
+    }
+  }
+
+  const stop = rafLoop((dt) => {
+    stepFSM(dt);
+    applyKinematics();
     if(container.__hud){
-      const tip = new THREE.Vector3(); eeMarker.getWorldPosition(tip);
-      const d = tip.distanceTo(target.position);
-      container.__hud.textContent = `${fsm.state} · ee Δ ${d.toFixed(2)}m · yaw ${(angles.j0*57.3).toFixed(0)}°${ik.reachable ? "" : " · OOR"}`;
+      container.__hud.textContent =
+        `${PHASES[st.phase]} · ${st.holding ? 'HOLD' : 'FREE'} · ` +
+        `yaw ${(st.q[0]*57.3).toFixed(0)}° · roll ${(st.q[2]*57.3).toFixed(0)}°`;
     }
     renderer.render(scene, camera);
   });
 
-  resizeObserver(container, (w,h)=>{
-    renderer.setSize(w,h,false);
-    const aspect = w/h;
-    const sz = 6;
-    camera.left = -sz*aspect/2; camera.right = sz*aspect/2;
-    camera.top = sz/2; camera.bottom = -sz/2;
+  resizeObserver(container, (w, h) => {
+    renderer.setSize(w, h, false);
+    const aspect = w / h;
+    camera.left = -SZ*aspect/2;
+    camera.right = SZ*aspect/2;
+    camera.top = SZ/2;
+    camera.bottom = -SZ/2;
     camera.updateProjectionMatrix();
   });
 
-  return { destroy(){ stop(); renderer.dispose(); renderer.domElement.remove(); } };
+  return {
+    randomize(){
+      poses = { pick: sampleValidPose(), place: sampleValidPose() };
+      st.holding = false;
+      st.phase = 0;
+      st.timer = 0;
+      resetScene();
+    },
+    destroy(){
+      stop();
+      renderer.dispose();
+      renderer.domElement.remove();
+    },
+  };
 };

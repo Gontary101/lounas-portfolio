@@ -222,22 +222,30 @@ function SimsSection() {
           </SimCard>
 
           <SimCard
-            title="Isometric manipulator // IK demo"
+            title="Isometric manipulator // pick-and-place"
             kicker="§ manipulation"
             sim="manip"
             subtitle={
               <span>
-                drag the <b>yellow cube</b> across the tabletop
+                autonomous cycle: approach · grasp · lift · transit · place
               </span>
             }
-            caption="4-DOF analytical IK (base yaw + 3R planar) with gripper aperture modulated by end-effector distance."
+            caption="6-DOF arm. Reachable pick/place poses sampled via FK — no IK, no unreachable targets."
+            controls={(simRef) => (
+              <button className="btn" onClick={() => simRef.current?.randomize()}>
+                New pick · place
+              </button>
+            )}
           >
             <div className="legend">
               <div className="ll">
-                <span className="sw" style={{ background: '#FFDE42' }} /> target
+                <span className="sw" style={{ background: '#FFDE42' }} /> payload
               </div>
               <div className="ll">
-                <span className="sw" style={{ background: '#C94A2B' }} /> gripper
+                <span className="sw" style={{ background: '#313E17', opacity: 0.6 }} /> drop zone
+              </div>
+              <div className="ll">
+                <span className="sw" style={{ background: '#1B0C0C' }} /> gripper
               </div>
             </div>
           </SimCard>
