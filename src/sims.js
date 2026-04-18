@@ -1405,3 +1405,516 @@ SIMS.manip = function(container){
     },
   };
 };
+
+// ==================================================
+// SLAM — differential-drive ground robot in a procedural room.
+// 120-beam 2D LiDAR feeds a log-odds occupancy grid (mapping),
+// a particle filter (MCL) estimates pose against the live map,
+// and an EKF fuses the PF mean as a pseudo-observation so the
+// covariance ellipse tightens as the belief converges.
+// ==================================================
+SIMS.slam = function(container){
+  const scene = new THREE.Scene();
+  const renderer = makeRenderer(container);
+  const rect = container.getBoundingClientRect();
+  renderer.setSize(rect.width, rect.height, false);
+
+  const ortho = () => {
+    const r = container.getBoundingClientRect();
+    const aspect = r.width / r.height;
+    const sz = 16;
+    return new THREE.OrthographicCamera(-sz*aspect/2, sz*aspect/2, sz/2, -sz/2, -80, 80);
+  };
+  let camera = ortho();
+  camera.position.set(3, 16, 3); // mild isometric tilt for 3D-ish feel
+  camera.lookAt(0,0,0);
+
+  standardLights(scene);
+
+  // ---- floor
+  const floor = new THREE.Mesh(
+    new THREE.PlaneGeometry(22, 15),
+    new THREE.MeshStandardMaterial({ color: C.bg2, roughness: 1 })
+  );
+  floor.rotation.x = -Math.PI/2; floor.receiveShadow = true; scene.add(floor);
+
+  // ---- world walls (line segments in XZ plane; y is world-Z)
+  let segments = [];
+  let wallGroup = null;
+
+  function makeWorld(){
+    segments = [];
+    const W = 9, H = 6;
+    segments.push({x0:-W,y0:-H,x1: W,y1:-H});
+    segments.push({x0: W,y0:-H,x1: W,y1: H});
+    segments.push({x0: W,y0: H,x1:-W,y1: H});
+    segments.push({x0:-W,y0: H,x1:-W,y1:-H});
+    for(let k=0; k<6; k++){
+      if(Math.random()<0.5){
+        const y = (Math.random()-0.5)*2*(H-1.5);
+        const cx = (Math.random()-0.5)*2*(W-2.5);
+        const L = 1.4 + Math.random()*2.6;
+        segments.push({x0:cx-L/2,y0:y,x1:cx+L/2,y1:y});
+      } else {
+        const x = (Math.random()-0.5)*2*(W-1.5);
+        const cy = (Math.random()-0.5)*2*(H-2);
+        const L = 1.2 + Math.random()*2;
+        segments.push({x0:x,y0:cy-L/2,x1:x,y1:cy+L/2});
+      }
+    }
+    rebuildWalls();
+    resetMap();
+    robot.x = 0; robot.y = 0; robot.th = 0;
+    resetBelief();
+  }
+
+  function rebuildWalls(){
+    if(wallGroup){ scene.remove(wallGroup); wallGroup.traverse(o=>o.geometry?.dispose?.()); }
+    wallGroup = new THREE.Group();
+    const mat = new THREE.MeshStandardMaterial({ color: C.ink, roughness: 0.9 });
+    for(const s of segments){
+      const dx = s.x1 - s.x0, dy = s.y1 - s.y0;
+      const L = Math.hypot(dx, dy);
+      const geo = new THREE.BoxGeometry(L, 0.55, 0.14);
+      const m = new THREE.Mesh(geo, mat);
+      m.position.set((s.x0+s.x1)/2, 0.275, (s.y0+s.y1)/2);
+      m.rotation.y = -Math.atan2(dy, dx);
+      m.castShadow = true; m.receiveShadow = true;
+      wallGroup.add(m);
+    }
+    scene.add(wallGroup);
+  }
+
+  // ---- ray–segment intersection
+  function raycast(ox, oy, dx, dy, maxR){
+    let best = maxR;
+    for(const s of segments){
+      const vx = s.x1 - s.x0, vy = s.y1 - s.y0;
+      const denom = dx * (-vy) + dy * vx;
+      if(Math.abs(denom) < 1e-9) continue;
+      const t = ((s.x0 - ox) * (-vy) + (s.y0 - oy) * (vx)) / denom;
+      const u = ((s.x0 - ox) * (-dy) + (s.y0 - oy) * (dx)) / denom;
+      if(t >= 0 && t < best && u >= 0 && u <= 1) best = t;
+    }
+    return best;
+  }
+
+  // ---- occupancy grid (log-odds)
+  const GRID_W = 100, GRID_H = 70;       // cells
+  const WORLD_W = 22, WORLD_H = 15;      // meters covered by the grid plane
+  const CELL = WORLD_W / GRID_W;         // 0.22 m
+  const logodds = new Float32Array(GRID_W * GRID_H);
+  const L_FREE = -0.35, L_OCC = 0.85, L_MIN = -4, L_MAX = 4;
+  function w2g(x, y){
+    return [
+      Math.floor((x + WORLD_W/2) / CELL),
+      Math.floor((y + WORLD_H/2) / CELL)
+    ];
+  }
+  function resetMap(){ logodds.fill(0); }
+
+  function bresenham(x0, y0, x1, y1, cb){
+    const dx = Math.abs(x1-x0), dy = Math.abs(y1-y0);
+    const sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+    let err = dx - dy, x = x0, y = y0;
+    for(let k=0; k<400; k++){
+      if(!cb(x, y)) return;
+      if(x === x1 && y === y1) return;
+      const e2 = 2 * err;
+      if(e2 > -dy){ err -= dy; x += sx; }
+      if(e2 <  dx){ err += dx; y += sy; }
+    }
+  }
+
+  function integrateScan(rx, ry, beams, maxR){
+    const [gx0, gy0] = w2g(rx, ry);
+    for(let i=0; i<beams.length; i+=2){  // every 2nd beam for speed
+      const b = beams[i];
+      const hit = b.r < maxR - 0.05;
+      const ex = rx + Math.cos(b.a) * b.r;
+      const ey = ry + Math.sin(b.a) * b.r;
+      const [gx1, gy1] = w2g(ex, ey);
+      bresenham(gx0, gy0, gx1, gy1, (x, y) => {
+        if(x < 0 || y < 0 || x >= GRID_W || y >= GRID_H) return false;
+        const idx = y * GRID_W + x;
+        if(x === gx1 && y === gy1 && hit){
+          logodds[idx] = Math.min(L_MAX, logodds[idx] + L_OCC);
+        } else {
+          logodds[idx] = Math.max(L_MIN, logodds[idx] + L_FREE);
+        }
+        return true;
+      });
+    }
+  }
+
+  // ---- occupancy grid → canvas texture
+  const mapCanvas = document.createElement('canvas');
+  mapCanvas.width = GRID_W; mapCanvas.height = GRID_H;
+  const mapCtx = mapCanvas.getContext('2d');
+  const mapImg = mapCtx.createImageData(GRID_W, GRID_H);
+  const mapTex = new THREE.CanvasTexture(mapCanvas);
+  mapTex.magFilter = THREE.NearestFilter;
+  mapTex.minFilter = THREE.NearestFilter;
+  mapTex.generateMipmaps = false;
+  const mapPlane = new THREE.Mesh(
+    new THREE.PlaneGeometry(WORLD_W, WORLD_H),
+    new THREE.MeshBasicMaterial({ map: mapTex, transparent: true, depthWrite: false })
+  );
+  mapPlane.rotation.x = -Math.PI/2;
+  mapPlane.position.y = 0.03;
+  scene.add(mapPlane);
+
+  function redrawMap(){
+    const d = mapImg.data;
+    for(let y=0; y<GRID_H; y++){
+      for(let x=0; x<GRID_W; x++){
+        const l = logodds[y * GRID_W + x];
+        const p = 1 / (1 + Math.exp(-l));
+        let r=0, g=0, b=0, a=0;
+        if(l === 0){ a = 0; }
+        else if(p > 0.55){ r=0x1B; g=0x0C; b=0x0C; a=Math.min(255, (p-0.5)*2*260); }
+        else if(p < 0.45){ r=0x4C; g=0x5C; b=0x2D; a=Math.min(110, (0.5-p)*2*110); }
+        const cy = GRID_H - 1 - y;  // flip V so +world-Z is "up" in texture
+        const j = (cy * GRID_W + x) * 4;
+        d[j]=r; d[j+1]=g; d[j+2]=b; d[j+3]=a;
+      }
+    }
+    mapCtx.putImageData(mapImg, 0, 0);
+    mapTex.needsUpdate = true;
+  }
+
+  // ---- robot state
+  const robot = { x:0, y:0, th:0, v:0.9, w:0 };
+  const waypoints = [[6,3],[6,-3],[-6,-3],[-6,3]];
+  let wpI = 0;
+
+  const body = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.28, 0.28, 0.18, 24),
+    new THREE.MeshStandardMaterial({ color: C.yellow, roughness: 0.55 })
+  );
+  body.castShadow = true; scene.add(body);
+  const nose = new THREE.Mesh(
+    new THREE.BoxGeometry(0.35, 0.04, 0.08),
+    new THREE.MeshBasicMaterial({ color: C.ink })
+  );
+  scene.add(nose);
+
+  // ---- LiDAR visualization
+  const BEAMS = 120, MAX_R = 9;
+  const rayGeo = new THREE.BufferGeometry();
+  const rayPos = new Float32Array(BEAMS * 2 * 3);
+  rayGeo.setAttribute('position', new THREE.BufferAttribute(rayPos, 3));
+  const rays = new THREE.LineSegments(
+    rayGeo,
+    new THREE.LineBasicMaterial({ color: C.yellow, transparent: true, opacity: 0.22 })
+  );
+  scene.add(rays);
+  const endGeo = new THREE.BufferGeometry();
+  const endPos = new Float32Array(BEAMS * 3);
+  endGeo.setAttribute('position', new THREE.BufferAttribute(endPos, 3));
+  const ends = new THREE.Points(
+    endGeo,
+    new THREE.PointsMaterial({ color: C.red, size: 0.09, sizeAttenuation: true })
+  );
+  scene.add(ends);
+
+  // ---- particle filter
+  const NP = 180;
+  let particles = [];
+  function resetBelief(){
+    particles = [];
+    for(let i=0; i<NP; i++){
+      particles.push({
+        x:  robot.x + (Math.random()-0.5)*0.8,
+        y:  robot.y + (Math.random()-0.5)*0.8,
+        th: robot.th + (Math.random()-0.5)*0.3,
+        w:  1/NP
+      });
+    }
+    ekf.x = robot.x; ekf.y = robot.y; ekf.th = robot.th;
+    ekf.P = [[0.4,0,0],[0,0.4,0],[0,0,0.15]];
+  }
+
+  const pGeo = new THREE.BufferGeometry();
+  const pPos = new Float32Array(NP * 3);
+  pGeo.setAttribute('position', new THREE.BufferAttribute(pPos, 3));
+  const pCloud = new THREE.Points(
+    pGeo,
+    new THREE.PointsMaterial({ color: C.forest, size: 0.08 })
+  );
+  scene.add(pCloud);
+
+  // ---- EKF state + covariance ellipse
+  const ekf = { x:0, y:0, th:0, P:[[0.4,0,0],[0,0.4,0],[0,0,0.15]] };
+  let lastK = [[0,0,0],[0,0,0],[0,0,0]];
+
+  const ELL_N = 72;
+  const ellGeo = new THREE.BufferGeometry();
+  const ellPos = new Float32Array((ELL_N+1) * 3);
+  ellGeo.setAttribute('position', new THREE.BufferAttribute(ellPos, 3));
+  const ell = new THREE.Line(
+    ellGeo,
+    new THREE.LineBasicMaterial({ color: C.red })
+  );
+  scene.add(ell);
+  const ekfMark = new THREE.Mesh(
+    new THREE.CircleGeometry(0.12, 18),
+    new THREE.MeshBasicMaterial({ color: C.red })
+  );
+  ekfMark.rotation.x = -Math.PI/2; scene.add(ekfMark);
+
+  // ---- small linear algebra
+  const wrap = a => Math.atan2(Math.sin(a), Math.cos(a));
+  const m3 = {
+    mul(A,B){ const C=[[0,0,0],[0,0,0],[0,0,0]];
+      for(let i=0;i<3;i++)for(let j=0;j<3;j++)
+        C[i][j]=A[i][0]*B[0][j]+A[i][1]*B[1][j]+A[i][2]*B[2][j];
+      return C;
+    },
+    T(A){ return [[A[0][0],A[1][0],A[2][0]],[A[0][1],A[1][1],A[2][1]],[A[0][2],A[1][2],A[2][2]]]; },
+    add(A,B){ const C=[[0,0,0],[0,0,0],[0,0,0]]; for(let i=0;i<3;i++)for(let j=0;j<3;j++)C[i][j]=A[i][j]+B[i][j]; return C; },
+    sub(A,B){ const C=[[0,0,0],[0,0,0],[0,0,0]]; for(let i=0;i<3;i++)for(let j=0;j<3;j++)C[i][j]=A[i][j]-B[i][j]; return C; },
+    inv(A){
+      const a=A[0][0],b=A[0][1],c=A[0][2],d=A[1][0],e=A[1][1],f=A[1][2],g=A[2][0],h=A[2][1],i=A[2][2];
+      const det=a*(e*i-f*h)-b*(d*i-f*g)+c*(d*h-e*g);
+      if(Math.abs(det)<1e-10) return [[1,0,0],[0,1,0],[0,0,1]];
+      const k=1/det;
+      return [
+        [(e*i-f*h)*k, -(b*i-c*h)*k,  (b*f-c*e)*k],
+        [-(d*i-f*g)*k, (a*i-c*g)*k, -(a*f-c*d)*k],
+        [(d*h-e*g)*k, -(a*h-b*g)*k,  (a*e-b*d)*k],
+      ];
+    }
+  };
+  const I3 = [[1,0,0],[0,1,0],[0,0,1]];
+
+  // ---- sim steps
+  let step = 0, resamples = 0;
+
+  function driveWaypoint(dt){
+    const wp = waypoints[wpI];
+    const dx = wp[0] - robot.x, dy = wp[1] - robot.y;
+    if(Math.hypot(dx, dy) < 0.45) wpI = (wpI + 1) % waypoints.length;
+    const want = Math.atan2(dy, dx);
+    const dth = wrap(want - robot.th);
+    robot.w = Math.max(-1.6, Math.min(1.6, dth * 2.4));
+    robot.v = 0.6 + Math.max(0, Math.cos(dth)) * 0.7;
+    robot.x += Math.cos(robot.th) * robot.v * dt;
+    robot.y += Math.sin(robot.th) * robot.v * dt;
+    robot.th = wrap(robot.th + robot.w * dt);
+  }
+
+  function lidarScan(){
+    const beams = new Array(BEAMS);
+    for(let i=0; i<BEAMS; i++){
+      const a = robot.th + (-Math.PI + (i/BEAMS) * 2*Math.PI);
+      const r = raycast(robot.x, robot.y, Math.cos(a), Math.sin(a), MAX_R);
+      beams[i] = { a, r: r + (Math.random()-0.5)*0.04 };
+    }
+    return beams;
+  }
+
+  function drawBeams(beams){
+    for(let i=0; i<BEAMS; i++){
+      const b = beams[i];
+      const ex = robot.x + Math.cos(b.a) * b.r;
+      const ey = robot.y + Math.sin(b.a) * b.r;
+      rayPos[i*6+0]=robot.x; rayPos[i*6+1]=0.05; rayPos[i*6+2]=robot.y;
+      rayPos[i*6+3]=ex;      rayPos[i*6+4]=0.05; rayPos[i*6+5]=ey;
+      endPos[i*3+0]=ex; endPos[i*3+1]=0.06; endPos[i*3+2]=ey;
+    }
+    rayGeo.attributes.position.needsUpdate = true;
+    endGeo.attributes.position.needsUpdate = true;
+  }
+
+  function pfPredict(dt){
+    for(const p of particles){
+      const v = robot.v + (Math.random()-0.5) * 0.2;
+      const w = robot.w + (Math.random()-0.5) * 0.3;
+      p.x += Math.cos(p.th) * v * dt;
+      p.y += Math.sin(p.th) * v * dt;
+      p.th = wrap(p.th + w * dt);
+    }
+  }
+
+  function pfWeight(beams){
+    const K = 18;
+    const sub = new Array(K);
+    for(let i=0; i<K; i++) sub[i] = beams[Math.floor(i * BEAMS / K)];
+    const sigma = 0.4;
+    let wSum = 0;
+    for(const p of particles){
+      let logw = 0;
+      for(const b of sub){
+        const a = p.th + (b.a - robot.th);
+        const predR = raycast(p.x, p.y, Math.cos(a), Math.sin(a), MAX_R);
+        const diff = predR - b.r;
+        logw += -(diff*diff) / (2*sigma*sigma);
+      }
+      p.w = Math.exp(logw / 4);  // temperature softens collapse
+      wSum += p.w;
+    }
+    if(wSum < 1e-20){ for(const p of particles) p.w = 1/NP; }
+    else            { for(const p of particles) p.w /= wSum; }
+  }
+
+  function pfResampleIfNeeded(){
+    let sqw = 0;
+    for(const p of particles) sqw += p.w*p.w;
+    const Neff = 1 / sqw;
+    if(Neff > NP * 0.5) return;
+    const stepW = 1/NP;
+    let u = Math.random() * stepW;
+    let c = particles[0].w, i = 0;
+    const out = new Array(NP);
+    for(let m=0; m<NP; m++){
+      while(u > c && i < NP-1){ i++; c += particles[i].w; }
+      const s = particles[i];
+      out[m] = {
+        x:  s.x  + (Math.random()-0.5)*0.025,
+        y:  s.y  + (Math.random()-0.5)*0.025,
+        th: wrap(s.th + (Math.random()-0.5)*0.012),
+        w:  1/NP
+      };
+      u += stepW;
+    }
+    particles = out;
+    resamples++;
+  }
+
+  function pfMean(){
+    let mx=0, my=0, ss=0, cc=0;
+    for(const p of particles){ mx+=p.x*p.w; my+=p.y*p.w; ss+=Math.sin(p.th)*p.w; cc+=Math.cos(p.th)*p.w; }
+    return { x: mx, y: my, th: Math.atan2(ss, cc) };
+  }
+  function pfCov(m){
+    let sxx=0, sxy=0, syy=0, sth=0;
+    for(const p of particles){
+      const dx=p.x-m.x, dy=p.y-m.y, dth=wrap(p.th-m.th);
+      sxx += p.w*dx*dx; sxy += p.w*dx*dy; syy += p.w*dy*dy; sth += p.w*dth*dth;
+    }
+    return [sxx, sxy, syy, sth];
+  }
+
+  function ekfPredict(dt){
+    const v = robot.v, w = robot.w, th = ekf.th;
+    ekf.x += Math.cos(th) * v * dt;
+    ekf.y += Math.sin(th) * v * dt;
+    ekf.th = wrap(ekf.th + w * dt);
+    const F = [
+      [1, 0, -Math.sin(th) * v * dt],
+      [0, 1,  Math.cos(th) * v * dt],
+      [0, 0, 1]
+    ];
+    const Q = [[0.015,0,0],[0,0.015,0],[0,0,0.008]];
+    ekf.P = m3.add(m3.mul(m3.mul(F, ekf.P), m3.T(F)), Q);
+  }
+  function ekfUpdate(z, R){
+    const S  = m3.add(ekf.P, R);              // H = I, so S = P + R
+    const K  = m3.mul(ekf.P, m3.inv(S));
+    lastK = K;
+    const y  = [ z.x - ekf.x, z.y - ekf.y, wrap(z.th - ekf.th) ];
+    ekf.x  += K[0][0]*y[0] + K[0][1]*y[1] + K[0][2]*y[2];
+    ekf.y  += K[1][0]*y[0] + K[1][1]*y[1] + K[1][2]*y[2];
+    ekf.th  = wrap(ekf.th + K[2][0]*y[0] + K[2][1]*y[1] + K[2][2]*y[2]);
+    ekf.P  = m3.mul(m3.sub(I3, K), ekf.P);
+  }
+
+  function drawParticles(){
+    for(let i=0; i<NP; i++){
+      pPos[i*3+0] = particles[i].x;
+      pPos[i*3+1] = 0.04;
+      pPos[i*3+2] = particles[i].y;
+    }
+    pGeo.attributes.position.needsUpdate = true;
+  }
+
+  function drawEllipse(){
+    const a = ekf.P[0][0], b = ekf.P[0][1], c = ekf.P[1][1];
+    const tr = a + c, det = a*c - b*b;
+    const disc = Math.max(0, tr*tr/4 - det);
+    const lam1 = tr/2 + Math.sqrt(disc);
+    const lam2 = tr/2 - Math.sqrt(disc);
+    const ang  = Math.atan2(2*b, a - c) / 2;
+    const s1 = 2.0 * Math.sqrt(Math.max(1e-4, lam1));
+    const s2 = 2.0 * Math.sqrt(Math.max(1e-4, lam2));
+    for(let i=0; i<=ELL_N; i++){
+      const t = (i/ELL_N) * Math.PI * 2;
+      const ex = Math.cos(t)*s1, ey = Math.sin(t)*s2;
+      const rx = ex*Math.cos(ang) - ey*Math.sin(ang);
+      const ry = ex*Math.sin(ang) + ey*Math.cos(ang);
+      ellPos[i*3+0] = ekf.x + rx;
+      ellPos[i*3+1] = 0.07;
+      ellPos[i*3+2] = ekf.y + ry;
+    }
+    ellGeo.attributes.position.needsUpdate = true;
+    ekfMark.position.set(ekf.x, 0.07, ekf.y);
+  }
+
+  // ---- bootstrap
+  makeWorld();
+
+  const hud = container.__hud;
+  const math = container.querySelector?.('.slam-math');
+
+  const stop = rafLoop((dt) => {
+    dt = Math.min(0.05, dt);
+    driveWaypoint(dt);
+    const beams = lidarScan();
+    drawBeams(beams);
+
+    pfPredict(dt);
+    if(step % 2 === 0) pfWeight(beams);      // throttle the expensive step
+    pfResampleIfNeeded();
+    drawParticles();
+
+    const mean = pfMean();
+    integrateScan(mean.x, mean.y, beams, MAX_R);
+    if(step % 3 === 0) redrawMap();
+
+    ekfPredict(dt);
+    const [sxx, sxy, syy, sth] = pfCov(mean);
+    const R = [
+      [Math.max(0.01, sxx), sxy,                  0],
+      [sxy,                 Math.max(0.01, syy),  0],
+      [0,                   0,                    Math.max(0.005, sth)]
+    ];
+    ekfUpdate(mean, R);
+    drawEllipse();
+
+    body.position.set(robot.x, 0.09, robot.y);
+    body.rotation.y = -robot.th;
+    nose.position.set(robot.x + Math.cos(robot.th)*0.3, 0.19, robot.y + Math.sin(robot.th)*0.3);
+    nose.rotation.y = -robot.th;
+
+    step++;
+    if(hud && step % 4 === 0){
+      const sig = Math.sqrt(ekf.P[0][0] + ekf.P[1][1]).toFixed(3);
+      const err = Math.hypot(ekf.x - robot.x, ekf.y - robot.y).toFixed(3);
+      hud.innerHTML = `${BEAMS} beams · ${NP} particles · σ<sub>xy</sub> ${sig} m · err ${err} m · resample ${resamples}`;
+    }
+    if(math && step % 6 === 0){
+      const fmt = v => v.toFixed(3);
+      const sx = Math.sqrt(ekf.P[0][0]), sy = Math.sqrt(ekf.P[1][1]), st_ = Math.sqrt(ekf.P[2][2]);
+      const Kn = Math.sqrt(lastK[0][0]*lastK[0][0] + lastK[1][1]*lastK[1][1]);
+      math.querySelector('[data-p]').textContent =
+        `σx ${fmt(sx)}  σy ${fmt(sy)}  σθ ${fmt(st_)}`;
+      math.querySelector('[data-k]').textContent =
+        `‖K‖ ${fmt(Kn)}   Nₑff ${fmt(1/particles.reduce((a,p)=>a+p.w*p.w, 0))}`;
+    }
+
+    renderer.render(scene, camera);
+  });
+
+  resizeObserver(container, (w, h) => {
+    renderer.setSize(w, h, false);
+    camera = ortho();
+    camera.position.set(3, 16, 3); camera.lookAt(0,0,0);
+  });
+
+  return {
+    destroy(){ stop(); renderer.dispose(); renderer.domElement.remove(); },
+    randomize(){ makeWorld(); },
+    reset(){ resetMap(); resetBelief(); }
+  };
+};
