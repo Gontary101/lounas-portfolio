@@ -16,8 +16,9 @@ const C = {
 
 // ---------- shared helpers ----------
 function makeRenderer(container){
-  const r = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-  r.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  const r = new THREE.WebGLRenderer({ antialias: false, alpha: true });
+  // Pixelated look: render at sub-native resolution, let CSS nearest-neighbor upscale.
+  r.setPixelRatio(0.5);
   const rect = container.getBoundingClientRect();
   r.setSize(rect.width, rect.height, false);
   r.setClearColor(C.bg, 0);
