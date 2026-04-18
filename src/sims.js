@@ -1477,6 +1477,8 @@ SIMS.slam = function(container){
     rebuildWalls();
     resetMap();
     robot.x = 0; robot.y = 0; robot.th = 0;
+    desiredTh = 0; rotAccum = 0; lastGD = Infinity; stuckTimer = 0;
+    wpI = 0;
     resetBelief();
   }
 
@@ -1740,23 +1742,43 @@ SIMS.slam = function(container){
   let step = 0, resamples = 0;
 
   let stuckTimer = 0;
+  let desiredTh = 0;      // low-pass filtered heading setpoint
+  let rotAccum = 0;       // unsigned rotation since last waypoint progress
+  let lastGD = Infinity;  // distance to current goal last frame
 
   function driveWaypoint(dt){
     const wp = waypoints[wpI];
     const gx = wp[0] - robot.x, gy = wp[1] - robot.y;
     const gd = Math.hypot(gx, gy);
-    if(gd < 0.5){ wpI = (wpI + 1) % waypoints.length; stuckTimer = 0; }
+    if(gd < 0.5){
+      wpI = (wpI + 1) % waypoints.length;
+      stuckTimer = 0; rotAccum = 0; lastGD = Infinity;
+    }
 
     // desired heading = goal direction + repulsion from nearby walls
-    const REPEL_R = 1.4, REPEL_K = 2.4;
+    const REPEL_R = 1.1, REPEL_K = 1.2;     // softer potential field
     const rep = wallRepulse(robot.x, robot.y, REPEL_R);
     const dx = (gx / Math.max(0.001, gd)) + rep.fx * REPEL_K;
     const dy = (gy / Math.max(0.001, gd)) + rep.fy * REPEL_K;
-    const want = Math.atan2(dy, dx);
-    const dth  = wrap(want - robot.th);
+    const rawWant = Math.atan2(dy, dx);
 
-    robot.w = Math.max(-2.0, Math.min(2.0, dth * 2.6));
-    robot.v = 0.5 + Math.max(0, Math.cos(dth)) * 0.7;
+    // Low-pass the target heading so repulsion jitter doesn't spin the robot.
+    const dTarget = wrap(rawWant - desiredTh);
+    desiredTh = wrap(desiredTh + dTarget * 0.25);
+
+    const dth = wrap(desiredTh - robot.th);
+    robot.w = Math.max(-1.4, Math.min(1.4, dth * 1.7));
+    robot.v = 0.5 + Math.max(0, Math.cos(dth)) * 0.6;
+
+    // Circling escape: if robot has rotated a lot without making progress
+    // toward the goal, force the next waypoint.
+    rotAccum += Math.abs(robot.w) * dt;
+    if(gd < lastGD - 0.01) rotAccum = Math.max(0, rotAccum - 0.5); // progress credit
+    lastGD = gd;
+    if(rotAccum > Math.PI * 3){
+      wpI = (wpI + 1) % waypoints.length;
+      rotAccum = 0; lastGD = Infinity;
+    }
 
     // Candidate next pose; reject if it would enter a wall
     const nx = robot.x + Math.cos(robot.th) * robot.v * dt;
