@@ -1515,7 +1515,8 @@ SIMS.slam = function(container){
 
   // ---- wall collision helpers
   const ROBOT_R = 0.32;          // physical robot radius
-  const WALL_PAD = 0.08;          // wall half-thickness (geometry) + slack
+  const WALL_PAD = 0.22;         // wall half-thickness + safety slack
+  const SLOW_R  = 0.9;           // start slowing down this far from nearest wall
 
   // Closest-point distance from (px, py) to segment s
   function distPointSeg(px, py, s){
@@ -1532,6 +1533,16 @@ SIMS.slam = function(container){
     const clear = ROBOT_R + WALL_PAD;
     for(const s of segments) if(distPointSeg(px, py, s).d < clear) return true;
     return false;
+  }
+
+  // Minimum distance from (px,py) to any wall's nearest point.
+  function nearestWall(px, py){
+    let best = Infinity;
+    for(const s of segments){
+      const d = distPointSeg(px, py, s).d;
+      if(d < best) best = d;
+    }
+    return best;
   }
 
   // Sum repulsive vector from every nearby wall (nearest-point normal, 1/d falloff)
@@ -1707,11 +1718,22 @@ SIMS.slam = function(container){
     new THREE.LineBasicMaterial({ color: C.red })
   );
   scene.add(ell);
-  const ekfMark = new THREE.Mesh(
-    new THREE.CircleGeometry(0.12, 18),
-    new THREE.MeshBasicMaterial({ color: C.red })
-  );
-  ekfMark.rotation.x = -Math.PI/2; scene.add(ekfMark);
+  // EKF center: small red '+' crosshair so it reads as "estimate", not a
+  // second robot.
+  const ekfMark = new THREE.Group();
+  {
+    const mkLine = (ax, ay, bx, by) => {
+      const g = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(ax, 0, ay),
+        new THREE.Vector3(bx, 0, by),
+      ]);
+      return new THREE.Line(g, new THREE.LineBasicMaterial({ color: C.red }));
+    };
+    const L = 0.18;
+    ekfMark.add(mkLine(-L, 0,  L, 0));
+    ekfMark.add(mkLine( 0,-L,  0, L));
+  }
+  scene.add(ekfMark);
 
   // ---- small linear algebra
   const wrap = a => Math.atan2(Math.sin(a), Math.cos(a));
@@ -1768,7 +1790,18 @@ SIMS.slam = function(container){
 
     const dth = wrap(desiredTh - robot.th);
     robot.w = Math.max(-1.4, Math.min(1.4, dth * 1.7));
-    robot.v = 0.5 + Math.max(0, Math.cos(dth)) * 0.6;
+    let v = 0.5 + Math.max(0, Math.cos(dth)) * 0.6;
+
+    // Slow down when close to a wall so we never pin ourselves at the
+    // collision threshold. Scales v linearly from full speed at SLOW_R
+    // down to 0 once we're at the clearance circle.
+    const nw    = nearestWall(robot.x, robot.y);
+    const clear = ROBOT_R + WALL_PAD;
+    if(nw < SLOW_R){
+      const scale = Math.max(0, (nw - clear) / (SLOW_R - clear));
+      v *= scale;
+    }
+    robot.v = v;
 
     // Circling escape: if robot has rotated a lot without making progress
     // toward the goal, force the next waypoint.

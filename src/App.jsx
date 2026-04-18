@@ -292,6 +292,9 @@ function SimsSection() {
               <div className="ll">
                 <span className="sw" style={{ border: '1px solid #C94A2B', background: 'transparent' }} /> EKF 2σ
               </div>
+              <div className="ll">
+                <span className="sw" style={{ background: '#C94A2B', height: 2, marginTop: 4 }} /> EKF estimate ⊕
+              </div>
             </div>
             <div className="slam-math">
               <div className="mh">EKF · PREDICT</div>
