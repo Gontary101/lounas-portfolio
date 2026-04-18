@@ -136,9 +136,10 @@ function SimsSection() {
           className="small"
           style={{ maxWidth: 720, color: 'var(--ink-soft)', marginBottom: 24 }}
         >
-          Three self-contained robotics demos. Click, drag, scroll. Each one
+          Four self-contained robotics demos. Click, drag, scroll. Each one
           mirrors a real component of the project work below — global planning,
-          reactive 6DOF navigation, and manipulation with inverse kinematics.
+          reactive 6DOF navigation, manipulation with inverse kinematics, and
+          probabilistic mapping & localization with an EKF overlay.
         </p>
 
         <div className="demo-grid">
@@ -247,6 +248,65 @@ function SimsSection() {
               <div className="ll">
                 <span className="sw" style={{ background: '#1B0C0C' }} /> gripper
               </div>
+            </div>
+          </SimCard>
+
+          <SimCard
+            title="2D SLAM // occupancy grid + PF + EKF"
+            kicker="§ perception"
+            sim="slam"
+            subtitle={
+              <span>
+                diff-drive robot · 120-beam LiDAR · live <b>log-odds</b> map,
+                particle filter, covariance ellipse
+              </span>
+            }
+            caption="Robot patrols a procedural room. LiDAR → log-odds occupancy grid with estimated-pose insertion; 180-particle MCL with scan-matching likelihood; 3-state EKF fuses the PF mean to drive the covariance ellipse. Particle weighting uses the ground-truth map — a 2D mapping demo with truth-assisted localization, not full SLAM."
+            controls={(simRef) => (
+              <>
+                <button className="btn" onClick={() => simRef.current?.randomize()}>
+                  New world
+                </button>
+                <button className="btn ghost" onClick={() => simRef.current?.reset()}>
+                  Reset belief
+                </button>
+              </>
+            )}
+          >
+            <div className="legend">
+              <div className="ll">
+                <span className="sw" style={{ background: '#FFDE42' }} /> robot
+              </div>
+              <div className="ll">
+                <span className="sw" style={{ background: '#C94A2B' }} /> LiDAR hits
+              </div>
+              <div className="ll">
+                <span className="sw" style={{ background: '#313E17' }} /> particles
+              </div>
+              <div className="ll">
+                <span className="sw" style={{ background: '#1B0C0C' }} /> occupied
+              </div>
+              <div className="ll">
+                <span className="sw" style={{ background: '#4C5C2D', opacity: 0.4 }} /> free
+              </div>
+              <div className="ll">
+                <span className="sw" style={{ border: '1px solid #C94A2B', background: 'transparent' }} /> EKF 2σ
+              </div>
+              <div className="ll">
+                <span className="sw" style={{ background: '#C94A2B', height: 2, marginTop: 4 }} /> EKF estimate ⊕
+              </div>
+            </div>
+            <div className="slam-math">
+              <div className="mh">EKF · PREDICT</div>
+              <div>x̂ₖ = f(x̂ₖ₋₁, uₖ)</div>
+              <div>Pₖ = F Pₖ₋₁ Fᵀ + Q</div>
+              <div className="mh">UPDATE</div>
+              <div>K = P Hᵀ (H P Hᵀ + R)⁻¹</div>
+              <div>x̂ ← x̂ + K(z − h(x̂))</div>
+              <div>P ← (I − K H) P</div>
+              <div className="sep" />
+              <div data-p>σx — σy — σθ —</div>
+              <div data-k>‖K‖ — Nₑff —</div>
             </div>
           </SimCard>
         </div>

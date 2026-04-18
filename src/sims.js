@@ -16,8 +16,9 @@ const C = {
 
 // ---------- shared helpers ----------
 function makeRenderer(container){
-  const r = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-  r.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  const r = new THREE.WebGLRenderer({ antialias: false, alpha: true });
+  // Pixelated look: render at sub-native resolution, let CSS nearest-neighbor upscale.
+  r.setPixelRatio(0.75);
   const rect = container.getBoundingClientRect();
   r.setSize(rect.width, rect.height, false);
   r.setClearColor(C.bg, 0);
@@ -1402,5 +1403,695 @@ SIMS.manip = function(container){
       renderer.dispose();
       renderer.domElement.remove();
     },
+  };
+};
+
+// ==================================================
+// SLAM — differential-drive ground robot in a procedural room.
+// 120-beam 2D LiDAR feeds a log-odds occupancy grid (mapping),
+// a particle filter (MCL) estimates pose against the live map,
+// and an EKF fuses the PF mean as a pseudo-observation so the
+// covariance ellipse tightens as the belief converges.
+// ==================================================
+SIMS.slam = function(container){
+  const scene = new THREE.Scene();
+  const renderer = makeRenderer(container);
+  const rect = container.getBoundingClientRect();
+  renderer.setSize(rect.width, rect.height, false);
+
+  const ortho = () => {
+    const r = container.getBoundingClientRect();
+    const aspect = r.width / r.height;
+    const sz = 18;
+    return new THREE.OrthographicCamera(-sz*aspect/2, sz*aspect/2, sz/2, -sz/2, -80, 80);
+  };
+  let camera = ortho();
+  camera.position.set(10, 12, 10); // true isometric-ish tilt (~45° azimuth, ~40° elevation)
+  camera.lookAt(0, 0, 0);
+
+  standardLights(scene);
+
+  // ---- floor
+  const floor = new THREE.Mesh(
+    new THREE.PlaneGeometry(22, 15),
+    new THREE.MeshStandardMaterial({ color: C.bg2, roughness: 1 })
+  );
+  floor.rotation.x = -Math.PI/2; floor.receiveShadow = true; scene.add(floor);
+
+  // ---- world walls (line segments in XZ plane; y is world-Z)
+  let segments = [];
+  let wallGroup = null;
+
+  function makeWorld(){
+    segments = [];
+    const W = 9, H = 6;
+    segments.push({x0:-W,y0:-H,x1: W,y1:-H});
+    segments.push({x0: W,y0:-H,x1: W,y1: H});
+    segments.push({x0: W,y0: H,x1:-W,y1: H});
+    segments.push({x0:-W,y0: H,x1:-W,y1:-H});
+
+    // Generate candidate internal walls, rejecting any that come too close
+    // to the robot spawn, the patrol waypoints, OR any previously accepted
+    // wall. That keeps corridors wide enough for the robot to fit.
+    const protect = [[0,0], ...waypoints];
+    const POINT_CLEAR = 0.9;
+    const WALL_CLEAR  = ROBOT_R * 2 + 0.35;   // ≈ 1 m corridor width
+    let tries = 0;
+    while(segments.length < 10 && tries++ < 120){
+      let cand;
+      if(Math.random()<0.5){
+        const y  = (Math.random()-0.5)*2*(H-1.5);
+        const cx = (Math.random()-0.5)*2*(W-2.5);
+        const L  = 1.4 + Math.random()*2.6;
+        cand = {x0:cx-L/2, y0:y, x1:cx+L/2, y1:y};
+      } else {
+        const x  = (Math.random()-0.5)*2*(W-1.5);
+        const cy = (Math.random()-0.5)*2*(H-2);
+        const L  = 1.2 + Math.random()*2;
+        cand = {x0:x, y0:cy-L/2, x1:x, y1:cy+L/2};
+      }
+      let ok = true;
+      for(const p of protect){
+        if(distPointSeg(p[0], p[1], cand).d < POINT_CLEAR){ ok = false; break; }
+      }
+      if(ok){
+        // Minimum separation from every existing wall — skip the outer 4 walls
+        // (candidate endpoints are already inside the room).
+        for(let i = 4; i < segments.length; i++){
+          const s2 = segments[i];
+          const dA = Math.min(
+            distPointSeg(cand.x0, cand.y0, s2).d,
+            distPointSeg(cand.x1, cand.y1, s2).d,
+            distPointSeg(s2.x0, s2.y0, cand).d,
+            distPointSeg(s2.x1, s2.y1, cand).d
+          );
+          if(dA < WALL_CLEAR){ ok = false; break; }
+        }
+      }
+      if(ok) segments.push(cand);
+    }
+    rebuildWalls();
+    resetMap();
+    robot.x = 0; robot.y = 0; robot.th = 0;
+    desiredTh = 0; rotAccum = 0; lastGD = Infinity; stuckTimer = 0;
+    wpI = 0;
+    resetBelief();
+  }
+
+  function rebuildWalls(){
+    if(wallGroup){ scene.remove(wallGroup); wallGroup.traverse(o=>o.geometry?.dispose?.()); }
+    wallGroup = new THREE.Group();
+    const mat = new THREE.MeshStandardMaterial({ color: C.ink, roughness: 0.9 });
+    for(const s of segments){
+      const dx = s.x1 - s.x0, dy = s.y1 - s.y0;
+      const L = Math.hypot(dx, dy);
+      const geo = new THREE.BoxGeometry(L, 0.38, 0.14);
+      const m = new THREE.Mesh(geo, mat);
+      m.position.set((s.x0+s.x1)/2, 0.19, (s.y0+s.y1)/2);
+      m.rotation.y = -Math.atan2(dy, dx);
+      m.castShadow = true; m.receiveShadow = true;
+      wallGroup.add(m);
+    }
+    scene.add(wallGroup);
+  }
+
+  // ---- ray–segment intersection
+  function raycast(ox, oy, dx, dy, maxR){
+    let best = maxR;
+    for(const s of segments){
+      const vx = s.x1 - s.x0, vy = s.y1 - s.y0;
+      const denom = dx * (-vy) + dy * vx;
+      if(Math.abs(denom) < 1e-9) continue;
+      const t = ((s.x0 - ox) * (-vy) + (s.y0 - oy) * (vx)) / denom;
+      const u = ((s.x0 - ox) * (-dy) + (s.y0 - oy) * (dx)) / denom;
+      if(t >= 0 && t < best && u >= 0 && u <= 1) best = t;
+    }
+    return best;
+  }
+
+  // ---- wall collision helpers
+  const ROBOT_R = 0.32;          // physical robot radius
+  const WALL_PAD = 0.12;         // wall half-thickness + slim safety slack
+  const SLOW_R  = 0.75;          // slowdown starts here (measured from lookahead)
+
+  // Closest-point distance from (px, py) to segment s
+  function distPointSeg(px, py, s){
+    const vx = s.x1 - s.x0, vy = s.y1 - s.y0;
+    const L2 = vx*vx + vy*vy;
+    let t = ((px - s.x0)*vx + (py - s.y0)*vy) / Math.max(1e-9, L2);
+    t = Math.max(0, Math.min(1, t));
+    const cx = s.x0 + t*vx, cy = s.y0 + t*vy;
+    return { d: Math.hypot(px - cx, py - cy), cx, cy };
+  }
+
+  // True if the circular robot at (px,py) overlaps any wall (+ its half-thickness)
+  function inCollision(px, py){
+    const clear = ROBOT_R + WALL_PAD;
+    for(const s of segments) if(distPointSeg(px, py, s).d < clear) return true;
+    return false;
+  }
+
+  // Minimum distance from (px,py) to any wall's nearest point.
+  function nearestWall(px, py){
+    let best = Infinity;
+    for(const s of segments){
+      const d = distPointSeg(px, py, s).d;
+      if(d < best) best = d;
+    }
+    return best;
+  }
+
+  // Sum repulsive vector from every nearby wall (nearest-point normal, 1/d falloff)
+  function wallRepulse(px, py, lookahead){
+    let fx = 0, fy = 0;
+    for(const s of segments){
+      const q = distPointSeg(px, py, s);
+      if(q.d > lookahead) continue;
+      const nx = (px - q.cx), ny = (py - q.cy);
+      const L = Math.max(0.01, Math.hypot(nx, ny));
+      const strength = (lookahead - q.d) / lookahead;   // 0..1
+      fx += (nx / L) * strength;
+      fy += (ny / L) * strength;
+    }
+    return { fx, fy };
+  }
+
+  // ---- occupancy grid (log-odds)
+  const GRID_W = 100, GRID_H = 70;       // cells
+  const WORLD_W = 22, WORLD_H = 15;      // meters covered by the grid plane
+  const CELL = WORLD_W / GRID_W;         // 0.22 m
+  const logodds = new Float32Array(GRID_W * GRID_H);
+  const L_FREE = -0.35, L_OCC = 0.85, L_MIN = -4, L_MAX = 4;
+  function w2g(x, y){
+    return [
+      Math.floor((x + WORLD_W/2) / CELL),
+      Math.floor((y + WORLD_H/2) / CELL)
+    ];
+  }
+  function resetMap(){ logodds.fill(0); }
+
+  function bresenham(x0, y0, x1, y1, cb){
+    const dx = Math.abs(x1-x0), dy = Math.abs(y1-y0);
+    const sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+    let err = dx - dy, x = x0, y = y0;
+    for(let k=0; k<400; k++){
+      if(!cb(x, y)) return;
+      if(x === x1 && y === y1) return;
+      const e2 = 2 * err;
+      if(e2 > -dy){ err -= dy; x += sx; }
+      if(e2 <  dx){ err += dx; y += sy; }
+    }
+  }
+
+  function integrateScan(rx, ry, rth, beams, maxR){
+    const [gx0, gy0] = w2g(rx, ry);
+    for(let i=0; i<beams.length; i+=2){  // every 2nd beam for speed
+      const b = beams[i];
+      const hit = b.r < maxR - 0.05;
+      const wa = rth + b.rel;              // world bearing consistent with rx,ry,rth
+      const ex = rx + Math.cos(wa) * b.r;
+      const ey = ry + Math.sin(wa) * b.r;
+      const [gx1, gy1] = w2g(ex, ey);
+      bresenham(gx0, gy0, gx1, gy1, (x, y) => {
+        if(x < 0 || y < 0 || x >= GRID_W || y >= GRID_H) return false;
+        const idx = y * GRID_W + x;
+        if(x === gx1 && y === gy1 && hit){
+          logodds[idx] = Math.min(L_MAX, logodds[idx] + L_OCC);
+        } else {
+          logodds[idx] = Math.max(L_MIN, logodds[idx] + L_FREE);
+        }
+        return true;
+      });
+    }
+  }
+
+  // ---- occupancy grid → canvas texture
+  const mapCanvas = document.createElement('canvas');
+  mapCanvas.width = GRID_W; mapCanvas.height = GRID_H;
+  const mapCtx = mapCanvas.getContext('2d');
+  const mapImg = mapCtx.createImageData(GRID_W, GRID_H);
+  const mapTex = new THREE.CanvasTexture(mapCanvas);
+  mapTex.magFilter = THREE.NearestFilter;
+  mapTex.minFilter = THREE.NearestFilter;
+  mapTex.generateMipmaps = false;
+  const mapPlane = new THREE.Mesh(
+    new THREE.PlaneGeometry(WORLD_W, WORLD_H),
+    new THREE.MeshBasicMaterial({ map: mapTex, transparent: true, depthWrite: false })
+  );
+  mapPlane.rotation.x = -Math.PI/2;
+  mapPlane.position.y = 0.03;
+  scene.add(mapPlane);
+
+  function redrawMap(){
+    const d = mapImg.data;
+    for(let y=0; y<GRID_H; y++){
+      for(let x=0; x<GRID_W; x++){
+        const l = logodds[y * GRID_W + x];
+        const p = 1 / (1 + Math.exp(-l));
+        let r=0, g=0, b=0, a=0;
+        if(l === 0){ a = 0; }
+        else if(p > 0.55){ r=0x1B; g=0x0C; b=0x0C; a=Math.min(255, (p-0.5)*2*260); }
+        else if(p < 0.45){ r=0x4C; g=0x5C; b=0x2D; a=Math.min(110, (0.5-p)*2*110); }
+        const cy = GRID_H - 1 - y;  // flip V so +world-Z is "up" in texture
+        const j = (cy * GRID_W + x) * 4;
+        d[j]=r; d[j+1]=g; d[j+2]=b; d[j+3]=a;
+      }
+    }
+    mapCtx.putImageData(mapImg, 0, 0);
+    mapTex.needsUpdate = true;
+  }
+
+  // ---- robot state
+  const robot = { x:0, y:0, th:0, v:0.9, w:0 };
+  const waypoints = [[6,3],[6,-3],[-6,-3],[-6,3]];
+  let wpI = 0;
+
+  const body = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.28, 0.28, 0.18, 24),
+    new THREE.MeshStandardMaterial({ color: C.yellow, roughness: 0.55 })
+  );
+  body.castShadow = true; scene.add(body);
+  const nose = new THREE.Mesh(
+    new THREE.BoxGeometry(0.35, 0.04, 0.08),
+    new THREE.MeshBasicMaterial({ color: C.ink })
+  );
+  scene.add(nose);
+
+  // ---- LiDAR visualization
+  const BEAMS = 120, MAX_R = 9;
+  const rayGeo = new THREE.BufferGeometry();
+  const rayPos = new Float32Array(BEAMS * 2 * 3);
+  rayGeo.setAttribute('position', new THREE.BufferAttribute(rayPos, 3));
+  const rays = new THREE.LineSegments(
+    rayGeo,
+    new THREE.LineBasicMaterial({ color: C.yellow, transparent: true, opacity: 0.22 })
+  );
+  scene.add(rays);
+  const endGeo = new THREE.BufferGeometry();
+  const endPos = new Float32Array(BEAMS * 3);
+  endGeo.setAttribute('position', new THREE.BufferAttribute(endPos, 3));
+  const ends = new THREE.Points(
+    endGeo,
+    new THREE.PointsMaterial({ color: C.red, size: 0.09, sizeAttenuation: true })
+  );
+  scene.add(ends);
+
+  // ---- particle filter
+  const NP = 180;
+  let particles = [];
+  function resetBelief(){
+    particles = [];
+    for(let i=0; i<NP; i++){
+      particles.push({
+        x:  robot.x + (Math.random()-0.5)*0.8,
+        y:  robot.y + (Math.random()-0.5)*0.8,
+        th: robot.th + (Math.random()-0.5)*0.3,
+        w:  1/NP
+      });
+    }
+    ekf.x = robot.x; ekf.y = robot.y; ekf.th = robot.th;
+    ekf.P = [[0.4,0,0],[0,0.4,0],[0,0,0.15]];
+  }
+
+  const pGeo = new THREE.BufferGeometry();
+  const pPos = new Float32Array(NP * 3);
+  pGeo.setAttribute('position', new THREE.BufferAttribute(pPos, 3));
+  const pCloud = new THREE.Points(
+    pGeo,
+    new THREE.PointsMaterial({ color: C.forest, size: 0.08 })
+  );
+  scene.add(pCloud);
+
+  // ---- EKF state + covariance ellipse
+  const ekf = { x:0, y:0, th:0, P:[[0.4,0,0],[0,0.4,0],[0,0,0.15]] };
+  let lastK = [[0,0,0],[0,0,0],[0,0,0]];
+
+  const ELL_N = 72;
+  const ellGeo = new THREE.BufferGeometry();
+  const ellPos = new Float32Array((ELL_N+1) * 3);
+  ellGeo.setAttribute('position', new THREE.BufferAttribute(ellPos, 3));
+  const ell = new THREE.Line(
+    ellGeo,
+    new THREE.LineBasicMaterial({ color: C.red })
+  );
+  scene.add(ell);
+  // EKF center: small red '+' crosshair so it reads as "estimate", not a
+  // second robot.
+  const ekfMark = new THREE.Group();
+  {
+    const mkLine = (ax, ay, bx, by) => {
+      const g = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(ax, 0, ay),
+        new THREE.Vector3(bx, 0, by),
+      ]);
+      return new THREE.Line(g, new THREE.LineBasicMaterial({ color: C.red }));
+    };
+    const L = 0.18;
+    ekfMark.add(mkLine(-L, 0,  L, 0));
+    ekfMark.add(mkLine( 0,-L,  0, L));
+  }
+  scene.add(ekfMark);
+
+  // ---- small linear algebra
+  const wrap = a => Math.atan2(Math.sin(a), Math.cos(a));
+  const m3 = {
+    mul(A,B){ const C=[[0,0,0],[0,0,0],[0,0,0]];
+      for(let i=0;i<3;i++)for(let j=0;j<3;j++)
+        C[i][j]=A[i][0]*B[0][j]+A[i][1]*B[1][j]+A[i][2]*B[2][j];
+      return C;
+    },
+    T(A){ return [[A[0][0],A[1][0],A[2][0]],[A[0][1],A[1][1],A[2][1]],[A[0][2],A[1][2],A[2][2]]]; },
+    add(A,B){ const C=[[0,0,0],[0,0,0],[0,0,0]]; for(let i=0;i<3;i++)for(let j=0;j<3;j++)C[i][j]=A[i][j]+B[i][j]; return C; },
+    sub(A,B){ const C=[[0,0,0],[0,0,0],[0,0,0]]; for(let i=0;i<3;i++)for(let j=0;j<3;j++)C[i][j]=A[i][j]-B[i][j]; return C; },
+    inv(A){
+      const a=A[0][0],b=A[0][1],c=A[0][2],d=A[1][0],e=A[1][1],f=A[1][2],g=A[2][0],h=A[2][1],i=A[2][2];
+      const det=a*(e*i-f*h)-b*(d*i-f*g)+c*(d*h-e*g);
+      if(Math.abs(det)<1e-10) return [[1,0,0],[0,1,0],[0,0,1]];
+      const k=1/det;
+      return [
+        [(e*i-f*h)*k, -(b*i-c*h)*k,  (b*f-c*e)*k],
+        [-(d*i-f*g)*k, (a*i-c*g)*k, -(a*f-c*d)*k],
+        [(d*h-e*g)*k, -(a*h-b*g)*k,  (a*e-b*d)*k],
+      ];
+    }
+  };
+  const I3 = [[1,0,0],[0,1,0],[0,0,1]];
+
+  // ---- sim steps
+  let step = 0, resamples = 0;
+
+  let stuckTimer = 0;
+  let desiredTh = 0;      // low-pass filtered heading setpoint
+  let rotAccum = 0;       // unsigned rotation since last waypoint progress
+  let lastGD = Infinity;  // distance to current goal last frame
+
+  function driveWaypoint(dt){
+    const wp = waypoints[wpI];
+    const gx = wp[0] - robot.x, gy = wp[1] - robot.y;
+    const gd = Math.hypot(gx, gy);
+    if(gd < 0.5){
+      wpI = (wpI + 1) % waypoints.length;
+      stuckTimer = 0; rotAccum = 0; lastGD = Infinity;
+    }
+
+    // desired heading = goal direction + repulsion from nearby walls
+    const REPEL_R = 1.0, REPEL_K = 1.2;
+    const rep = wallRepulse(robot.x, robot.y, REPEL_R);
+    const dx = (gx / Math.max(0.001, gd)) + rep.fx * REPEL_K;
+    const dy = (gy / Math.max(0.001, gd)) + rep.fy * REPEL_K;
+    const rawWant = Math.atan2(dy, dx);
+
+    // dt-correct low-pass so the filter behaves the same across frame rates.
+    const TAU = 0.18;
+    const alpha = 1 - Math.exp(-dt / TAU);
+    const dTarget = wrap(rawWant - desiredTh);
+    desiredTh = wrap(desiredTh + dTarget * alpha);
+
+    const dth = wrap(desiredTh - robot.th);
+    robot.w = Math.max(-1.4, Math.min(1.4, dth * 1.7));
+
+    // Forward speed strongly gated by heading error — turn first, drive second.
+    // Zero forward speed past ~50° error prevents nose-into-wall wobble.
+    let v = 1.0 * Math.max(0, Math.cos(dth));
+    if(Math.abs(dth) > 0.9) v = 0;
+
+    // Slow down only when the direction we're actually going is close to
+    // a wall. Use a lookahead point instead of the robot center, so a wall
+    // 0.7 m to the side doesn't throttle us when we're heading past it.
+    const look = 0.45;
+    const px = robot.x + Math.cos(robot.th) * look;
+    const py = robot.y + Math.sin(robot.th) * look;
+    const nwAhead = nearestWall(px, py);
+    const clear = ROBOT_R + WALL_PAD;
+    if(nwAhead < SLOW_R){
+      const scale = Math.max(0, (nwAhead - clear) / (SLOW_R - clear));
+      v *= scale;
+    }
+
+    // ESCAPE: when the forward path is genuinely blocked, override the
+    // potential-field command with a rotation toward whichever side has
+    // more clearance. Breaks local minima where goal and repulsion cancel
+    // along the robot's heading.
+    if(nwAhead < clear + 0.05){
+      const SIDE = 0.7;        // rad, check clearance this far off-axis
+      const pxL = robot.x + Math.cos(robot.th + SIDE) * look;
+      const pyL = robot.y + Math.sin(robot.th + SIDE) * look;
+      const pxR = robot.x + Math.cos(robot.th - SIDE) * look;
+      const pyR = robot.y + Math.sin(robot.th - SIDE) * look;
+      const nwL = nearestWall(pxL, pyL);
+      const nwR = nearestWall(pxR, pyR);
+      robot.w  = (nwL > nwR ? +1 : -1) * 1.3;
+      desiredTh = robot.th + (nwL > nwR ? +SIDE : -SIDE); // nudge the filter
+      v = 0;
+    }
+    robot.v = v;
+
+    // Circling escape: if robot has rotated a lot without making progress
+    // toward the goal, force the next waypoint.
+    rotAccum += Math.abs(robot.w) * dt;
+    if(gd < lastGD - 0.01) rotAccum = Math.max(0, rotAccum - 0.5); // progress credit
+    lastGD = gd;
+    if(rotAccum > Math.PI * 3){
+      wpI = (wpI + 1) % waypoints.length;
+      rotAccum = 0; lastGD = Infinity;
+    }
+
+    // Candidate next pose; reject if it would enter a wall
+    const nx = robot.x + Math.cos(robot.th) * robot.v * dt;
+    const ny = robot.y + Math.sin(robot.th) * robot.v * dt;
+    if(!inCollision(nx, ny)){
+      robot.x = nx; robot.y = ny;
+      stuckTimer = 0;
+    } else {
+      // blocked — try sliding along each world axis independently
+      const nx2 = robot.x + Math.cos(robot.th) * robot.v * dt;
+      const ny2 = robot.y;
+      if(!inCollision(nx2, ny2)){ robot.x = nx2; }
+      else {
+        const nx3 = robot.x;
+        const ny3 = robot.y + Math.sin(robot.th) * robot.v * dt;
+        if(!inCollision(nx3, ny3)) robot.y = ny3;
+      }
+      robot.v = 0;
+      stuckTimer += dt;
+      // if we've been pinned to a wall for >1.5 s, skip to the next waypoint
+      if(stuckTimer > 1.5){ wpI = (wpI + 1) % waypoints.length; stuckTimer = 0; }
+    }
+    robot.th = wrap(robot.th + robot.w * dt);
+  }
+
+  function lidarScan(){
+    const beams = new Array(BEAMS);
+    for(let i=0; i<BEAMS; i++){
+      const rel = -Math.PI + (i/BEAMS) * 2*Math.PI;   // body-frame bearing
+      const a   = robot.th + rel;                     // world bearing (truth)
+      const r   = raycast(robot.x, robot.y, Math.cos(a), Math.sin(a), MAX_R);
+      beams[i] = { rel, a, r: r + (Math.random()-0.5)*0.04 };
+    }
+    return beams;
+  }
+
+  function drawBeams(beams){
+    for(let i=0; i<BEAMS; i++){
+      const b = beams[i];
+      const ex = robot.x + Math.cos(b.a) * b.r;
+      const ey = robot.y + Math.sin(b.a) * b.r;
+      rayPos[i*6+0]=robot.x; rayPos[i*6+1]=0.05; rayPos[i*6+2]=robot.y;
+      rayPos[i*6+3]=ex;      rayPos[i*6+4]=0.05; rayPos[i*6+5]=ey;
+      endPos[i*3+0]=ex; endPos[i*3+1]=0.06; endPos[i*3+2]=ey;
+    }
+    rayGeo.attributes.position.needsUpdate = true;
+    endGeo.attributes.position.needsUpdate = true;
+  }
+
+  function pfPredict(dt){
+    for(const p of particles){
+      const v = robot.v + (Math.random()-0.5) * 0.2;
+      const w = robot.w + (Math.random()-0.5) * 0.3;
+      p.x += Math.cos(p.th) * v * dt;
+      p.y += Math.sin(p.th) * v * dt;
+      p.th = wrap(p.th + w * dt);
+    }
+  }
+
+  function pfWeight(beams){
+    const K = 18;
+    const sub = new Array(K);
+    for(let i=0; i<K; i++) sub[i] = beams[Math.floor(i * BEAMS / K)];
+    const sigma = 0.4;
+    let wSum = 0;
+    for(const p of particles){
+      let logw = 0;
+      for(const b of sub){
+        const a = p.th + b.rel;
+        const predR = raycast(p.x, p.y, Math.cos(a), Math.sin(a), MAX_R);
+        const diff = predR - b.r;
+        logw += -(diff*diff) / (2*sigma*sigma);
+      }
+      p.w = Math.exp(logw / 4);  // temperature softens collapse
+      wSum += p.w;
+    }
+    if(wSum < 1e-20){ for(const p of particles) p.w = 1/NP; }
+    else            { for(const p of particles) p.w /= wSum; }
+  }
+
+  function pfResampleIfNeeded(){
+    let sqw = 0;
+    for(const p of particles) sqw += p.w*p.w;
+    const Neff = 1 / sqw;
+    if(Neff > NP * 0.5) return;
+    const stepW = 1/NP;
+    let u = Math.random() * stepW;
+    let c = particles[0].w, i = 0;
+    const out = new Array(NP);
+    for(let m=0; m<NP; m++){
+      while(u > c && i < NP-1){ i++; c += particles[i].w; }
+      const s = particles[i];
+      out[m] = {
+        x:  s.x  + (Math.random()-0.5)*0.025,
+        y:  s.y  + (Math.random()-0.5)*0.025,
+        th: wrap(s.th + (Math.random()-0.5)*0.012),
+        w:  1/NP
+      };
+      u += stepW;
+    }
+    particles = out;
+    resamples++;
+  }
+
+  function pfMean(){
+    let mx=0, my=0, ss=0, cc=0;
+    for(const p of particles){ mx+=p.x*p.w; my+=p.y*p.w; ss+=Math.sin(p.th)*p.w; cc+=Math.cos(p.th)*p.w; }
+    return { x: mx, y: my, th: Math.atan2(ss, cc) };
+  }
+  function pfCov(m){
+    let sxx=0, sxy=0, syy=0, sth=0;
+    for(const p of particles){
+      const dx=p.x-m.x, dy=p.y-m.y, dth=wrap(p.th-m.th);
+      sxx += p.w*dx*dx; sxy += p.w*dx*dy; syy += p.w*dy*dy; sth += p.w*dth*dth;
+    }
+    return [sxx, sxy, syy, sth];
+  }
+
+  function ekfPredict(dt){
+    const v = robot.v, w = robot.w, th = ekf.th;
+    ekf.x += Math.cos(th) * v * dt;
+    ekf.y += Math.sin(th) * v * dt;
+    ekf.th = wrap(ekf.th + w * dt);
+    const F = [
+      [1, 0, -Math.sin(th) * v * dt],
+      [0, 1,  Math.cos(th) * v * dt],
+      [0, 0, 1]
+    ];
+    const Q = [[0.015,0,0],[0,0.015,0],[0,0,0.008]];
+    ekf.P = m3.add(m3.mul(m3.mul(F, ekf.P), m3.T(F)), Q);
+  }
+  function ekfUpdate(z, R){
+    const S  = m3.add(ekf.P, R);              // H = I, so S = P + R
+    const K  = m3.mul(ekf.P, m3.inv(S));
+    lastK = K;
+    const y  = [ z.x - ekf.x, z.y - ekf.y, wrap(z.th - ekf.th) ];
+    ekf.x  += K[0][0]*y[0] + K[0][1]*y[1] + K[0][2]*y[2];
+    ekf.y  += K[1][0]*y[0] + K[1][1]*y[1] + K[1][2]*y[2];
+    ekf.th  = wrap(ekf.th + K[2][0]*y[0] + K[2][1]*y[1] + K[2][2]*y[2]);
+    ekf.P  = m3.mul(m3.sub(I3, K), ekf.P);
+  }
+
+  function drawParticles(){
+    for(let i=0; i<NP; i++){
+      pPos[i*3+0] = particles[i].x;
+      pPos[i*3+1] = 0.04;
+      pPos[i*3+2] = particles[i].y;
+    }
+    pGeo.attributes.position.needsUpdate = true;
+  }
+
+  function drawEllipse(){
+    const a = ekf.P[0][0], b = ekf.P[0][1], c = ekf.P[1][1];
+    const tr = a + c, det = a*c - b*b;
+    const disc = Math.max(0, tr*tr/4 - det);
+    const lam1 = tr/2 + Math.sqrt(disc);
+    const lam2 = tr/2 - Math.sqrt(disc);
+    const ang  = Math.atan2(2*b, a - c) / 2;
+    const s1 = 2.0 * Math.sqrt(Math.max(1e-4, lam1));
+    const s2 = 2.0 * Math.sqrt(Math.max(1e-4, lam2));
+    for(let i=0; i<=ELL_N; i++){
+      const t = (i/ELL_N) * Math.PI * 2;
+      const ex = Math.cos(t)*s1, ey = Math.sin(t)*s2;
+      const rx = ex*Math.cos(ang) - ey*Math.sin(ang);
+      const ry = ex*Math.sin(ang) + ey*Math.cos(ang);
+      ellPos[i*3+0] = ekf.x + rx;
+      ellPos[i*3+1] = 0.07;
+      ellPos[i*3+2] = ekf.y + ry;
+    }
+    ellGeo.attributes.position.needsUpdate = true;
+    ekfMark.position.set(ekf.x, 0.07, ekf.y);
+  }
+
+  // ---- bootstrap
+  makeWorld();
+
+  const hud = container.__hud;
+  const math = container.querySelector?.('.slam-math');
+
+  const stop = rafLoop((dt) => {
+    dt = Math.min(0.05, dt);
+    driveWaypoint(dt);
+    const beams = lidarScan();
+    drawBeams(beams);
+
+    pfPredict(dt);
+    if(step % 2 === 0) pfWeight(beams);      // throttle the expensive step
+    pfResampleIfNeeded();
+    drawParticles();
+
+    const mean = pfMean();
+    integrateScan(mean.x, mean.y, mean.th, beams, MAX_R);
+    if(step % 3 === 0) redrawMap();
+
+    ekfPredict(dt);
+    const [sxx, sxy, syy, sth] = pfCov(mean);
+    const R = [
+      [Math.max(0.01, sxx), sxy,                  0],
+      [sxy,                 Math.max(0.01, syy),  0],
+      [0,                   0,                    Math.max(0.005, sth)]
+    ];
+    ekfUpdate(mean, R);
+    drawEllipse();
+
+    body.position.set(robot.x, 0.09, robot.y);
+    body.rotation.y = -robot.th;
+    nose.position.set(robot.x + Math.cos(robot.th)*0.3, 0.19, robot.y + Math.sin(robot.th)*0.3);
+    nose.rotation.y = -robot.th;
+
+    step++;
+    if(hud && step % 4 === 0){
+      const sig = Math.sqrt(ekf.P[0][0] + ekf.P[1][1]).toFixed(3);
+      const err = Math.hypot(ekf.x - robot.x, ekf.y - robot.y).toFixed(3);
+      hud.innerHTML = `${BEAMS} beams · ${NP} particles · σ<sub>xy</sub> ${sig} m · err ${err} m · resample ${resamples}`;
+    }
+    if(math && step % 6 === 0){
+      const fmt = v => v.toFixed(3);
+      const sx = Math.sqrt(ekf.P[0][0]), sy = Math.sqrt(ekf.P[1][1]), st_ = Math.sqrt(ekf.P[2][2]);
+      const Kn = Math.sqrt(lastK[0][0]*lastK[0][0] + lastK[1][1]*lastK[1][1]);
+      math.querySelector('[data-p]').textContent =
+        `σx ${fmt(sx)}  σy ${fmt(sy)}  σθ ${fmt(st_)}`;
+      math.querySelector('[data-k]').textContent =
+        `‖K‖ ${fmt(Kn)}   Nₑff ${fmt(1/particles.reduce((a,p)=>a+p.w*p.w, 0))}`;
+    }
+
+    renderer.render(scene, camera);
+  });
+
+  resizeObserver(container, (w, h) => {
+    renderer.setSize(w, h, false);
+    camera = ortho();
+    camera.position.set(10, 12, 10); camera.lookAt(0, 0, 0);
+  });
+
+  return {
+    destroy(){ stop(); renderer.dispose(); renderer.domElement.remove(); },
+    randomize(){ makeWorld(); },
+    reset(){ resetMap(); resetBelief(); }
   };
 };
