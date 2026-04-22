@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, Fragment } from 'react';
+import { Analytics } from '@vercel/analytics/react';
 import { SIMS } from './sims.js';
 import { LangProvider, useLang } from './LangContext.jsx';
 
@@ -533,6 +534,7 @@ export default function App() {
   return (
     <LangProvider>
       <AppInner />
+      <Analytics />
     </LangProvider>
   );
 }
