@@ -34,7 +34,7 @@ function MobileNav() {
       <a href="#experience">{n.experience}</a>
       <a href="#skills">{n.skills}</a>
       <a href="#contact">{n.contact}</a>
-      <button className="lang-toggle-sm" onClick={toggle}>{lang.toUpperCase()}</button>
+      <button className="lang-toggle-sm" onClick={toggle} aria-label="Switch language">{lang.toUpperCase()}</button>
     </nav>
   );
 }
@@ -324,12 +324,12 @@ function Projects() {
                         <h4 style={{ marginTop: 20 }}>{s.reports}</h4>
                         <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                           {p.report && (
-                            <a className="dl-link" href={p.report.src} target="_blank" rel="noopener">
+                            <a className="dl-link" href={p.report.src} target="_blank" rel="noopener noreferrer">
                               ↓ {p.report.label}
                             </a>
                           )}
                           {p.report2 && (
-                            <a className="dl-link" href={p.report2.src} target="_blank" rel="noopener">
+                            <a className="dl-link" href={p.report2.src} target="_blank" rel="noopener noreferrer">
                               ↓ {p.report2.label}
                             </a>
                           )}
@@ -345,7 +345,7 @@ function Projects() {
                     {p.videos && p.videos.length > 0 && (
                       <>
                         <h4 style={{ marginTop: 20 }}>{s.demoVideos}</h4>
-                        <div style={{ display: 'grid', gridTemplateColumns: `repeat(${Math.min(p.videos.length, 2)}, minmax(0, 1fr))`, gap: 12 }}>
+                        <div className="proj-video-grid">
                           {p.videos.map((v, i) => (
                             <div key={i}>
                               <video
@@ -399,7 +399,7 @@ function ExperienceSection() {
           ))}
         </div>
 
-        <div className="section-head" style={{ marginTop: 80 }}>
+        <div className="section-head section-sub-head">
           <span className="section-num mono">{s.eduNum}</span>
           <h2 className="section-title">{s.eduTitle}</h2>
         </div>
@@ -459,7 +459,7 @@ function About() {
           <span className="section-kicker">{s.kicker}</span>
         </div>
         <div className="about-grid">
-          <p style={{ fontSize: 22, lineHeight: 1.5, margin: 0, letterSpacing: '-0.01em', maxWidth: 640 }}>
+          <p className="about-body">
             {s.para}
           </p>
           <div className="mono small" style={{ color: 'var(--ink-soft)', lineHeight: 1.8 }}>
@@ -529,6 +529,7 @@ function AppInner() {
     <>
       <Nav />
       <MobileNav />
+      <main>
       <Hero />
       <StatsBar />
       <Projects />
@@ -537,6 +538,7 @@ function AppInner() {
       <SkillsSection />
       <About />
       <Contact />
+      </main>
       <footer>
         <div className="wrap" style={{ display: 'flex', justifyContent: 'space-between', width: '100%', flexWrap: 'wrap', gap: 12 }}>
           <span>{ui.footer}</span>

@@ -404,12 +404,24 @@ a{ color: inherit; text-decoration:none;}
 /* === skills === */
 .skill-grid{ display:grid; grid-template-columns: repeat(3, 1fr); gap: 0; border: 1px solid var(--ink); }
 .skill-cell{ padding: 20px; border-right: 1px solid var(--hair); border-bottom: 1px solid var(--hair); }
-.skill-cell:nth-child(3n){ border-right: none;}
+.skill-cell:nth-child(3n){ border-right: none; }
+/* remove bottom border from last row to avoid double-line with grid outer border */
+.skill-cell:nth-last-child(-n+3){ border-bottom: none; }
 .skill-cell h5{ font-family: var(--mono); font-size: 11px; text-transform:uppercase; letter-spacing:0.14em; color: var(--forest); margin: 0 0 14px;}
 .skill-cell ul{ list-style:none; padding:0; margin:0; display:flex; flex-wrap:wrap; gap: 6px;}
 .skill-cell li{ font-family: var(--mono); font-size: 11px; padding: 4px 8px; border: 1px solid var(--hair-2); border-radius: 2px; color: var(--ink); }
-@media (max-width: 900px){ .skill-grid{ grid-template-columns: 1fr 1fr;} .skill-cell:nth-child(3n){ border-right: 1px solid var(--hair);} .skill-cell:nth-child(2n){ border-right: none;} }
-@media (max-width: 520px){ .skill-grid{ grid-template-columns: 1fr;} .skill-cell{ border-right: none!important;} }
+@media (max-width: 900px){
+  .skill-grid{ grid-template-columns: 1fr 1fr;}
+  .skill-cell:nth-child(3n){ border-right: 1px solid var(--hair);}
+  .skill-cell:nth-child(2n){ border-right: none;}
+  .skill-cell:nth-last-child(-n+3){ border-bottom: 1px solid var(--hair); }
+  .skill-cell:nth-last-child(-n+2){ border-bottom: none; }
+}
+@media (max-width: 520px){
+  .skill-grid{ grid-template-columns: 1fr;}
+  .skill-cell{ border-right: none!important; border-bottom: 1px solid var(--hair)!important; }
+  .skill-cell:last-child{ border-bottom: none!important; }
+}
 
 /* === contact === */
 .contact{
@@ -511,6 +523,22 @@ footer{
   display: grid; grid-template-columns: 1fr 1fr; gap: 40px;
 }
 @media(max-width:720px){ .about-grid{ grid-template-columns: 1fr; gap: 20px; } }
+
+.about-body{
+  font-size: 22px; line-height: 1.5; margin: 0;
+  letter-spacing: -0.01em; max-width: 640px;
+}
+@media(max-width:540px){ .about-body{ font-size: 18px; } }
+
+.section-sub-head{ margin-top: 80px; }
+@media(max-width:720px){ .section-sub-head{ margin-top: 40px; } }
+@media(max-width:540px){ .section-sub-head{ margin-top: 28px; } }
+
+.proj-video-grid{
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
 
 /* === global mobile layout === */
 @media(max-width:720px){
