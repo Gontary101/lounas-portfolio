@@ -23,6 +23,22 @@ function Nav() {
   );
 }
 
+// ============ MOBILE NAV ============
+function MobileNav() {
+  const { ui, lang, toggle } = useLang();
+  const n = ui.nav;
+  return (
+    <nav className="nav-mobile">
+      <a href="#work">{n.work}</a>
+      <a href="#sims">{n.sims}</a>
+      <a href="#experience">{n.experience}</a>
+      <a href="#skills">{n.skills}</a>
+      <a href="#contact">{n.contact}</a>
+      <button className="lang-toggle-sm" onClick={toggle}>{lang.toUpperCase()}</button>
+    </nav>
+  );
+}
+
 // ============ HERO ============
 function Hero() {
   const ref = useRef(null);
@@ -442,7 +458,7 @@ function About() {
           <h2 className="section-title">{s.title}</h2>
           <span className="section-kicker">{s.kicker}</span>
         </div>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 40 }} className="about-grid">
+        <div className="about-grid">
           <p style={{ fontSize: 22, lineHeight: 1.5, margin: 0, letterSpacing: '-0.01em', maxWidth: 640 }}>
             {s.para}
           </p>
@@ -512,6 +528,7 @@ function AppInner() {
   return (
     <>
       <Nav />
+      <MobileNav />
       <Hero />
       <StatsBar />
       <Projects />

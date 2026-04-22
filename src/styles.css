@@ -125,6 +125,50 @@ a{ color: inherit; text-decoration:none;}
   .nav{ display:none; }
 }
 
+/* === mobile bottom nav === */
+.nav-mobile{
+  display: none;
+  position: fixed; bottom: 0; left: 0; right: 0;
+  z-index: 100;
+  background: rgba(244,239,230,0.96);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border-top: 1px solid var(--hair-2);
+  padding: 6px 8px;
+  padding-bottom: calc(6px + env(safe-area-inset-bottom, 0px));
+  gap: 2px;
+  justify-content: space-around;
+  align-items: stretch;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+@media(max-width:860px){ .nav-mobile{ display:flex; } }
+
+.nav-mobile a{
+  font-family: var(--mono); font-size: 11px;
+  padding: 8px 12px; border-radius: 6px;
+  text-transform: uppercase; letter-spacing: 0.1em;
+  color: var(--ink-soft);
+  transition: background 0.15s, color 0.15s;
+  white-space: nowrap;
+  display: flex; align-items: center; justify-content: center;
+}
+.nav-mobile a:hover, .nav-mobile a:active{ background: var(--bg-2); color: var(--ink); }
+
+.nav-mobile .lang-toggle-sm{
+  font-family: var(--mono); font-size: 11px;
+  padding: 8px 12px; border-radius: 6px;
+  border: 1px solid var(--hair-2);
+  background: transparent; color: var(--ink-soft);
+  text-transform: uppercase; letter-spacing: 0.1em;
+  cursor: pointer; white-space: nowrap;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+  display: flex; align-items: center; justify-content: center;
+}
+.nav-mobile .lang-toggle-sm:hover, .nav-mobile .lang-toggle-sm:active{
+  background: var(--ink); color: var(--bg); border-color: var(--ink);
+}
+
 /* === hero === */
 .hero{
   position:relative;
@@ -372,16 +416,21 @@ a{ color: inherit; text-decoration:none;}
   display:grid; grid-template-columns: 1fr 1fr; gap: 32px; align-items:end;
 }
 .contact .giant{
-  font-family: var(--display); font-size: clamp(24px, 4.5vw, 56px); line-height: 1.1;
+  font-family: var(--display); font-size: clamp(16px, 4.5vw, 56px); line-height: 1.1;
   letter-spacing: 0; margin: 0; text-transform: uppercase; font-weight: 700;
+  overflow-wrap: break-word; word-break: break-word;
 }
 .contact .giant a{ display:block; border-bottom: 2px solid transparent; }
 .contact .giant a:hover{ border-bottom-color: var(--yellow); color: var(--forest);}
 .contact .links{ display:flex; flex-direction:column; gap: 10px; font-family: var(--mono); font-size: 13px; }
-.contact .links a{ display:flex; justify-content:space-between; padding: 12px 0; border-bottom: 1px solid var(--hair); transition: padding 0.2s;}
+.contact .links a{ display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:4px; padding: 12px 0; border-bottom: 1px solid var(--hair); transition: padding 0.2s;}
 .contact .links a:hover{ padding-left: 8px; color: var(--forest); }
-.contact .links a .arr{ color: var(--ink-soft); }
+.contact .links a .arr{ color: var(--ink-soft); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width: 60%; }
 @media (max-width: 860px){ .contact{ grid-template-columns: 1fr; } }
+@media (max-width: 480px){
+  .contact .links a .arr{ max-width: 100%; white-space: normal; word-break: break-all; }
+  .contact .links{ font-size: 11px; }
+}
 
 /* === footer === */
 footer{
@@ -390,6 +439,9 @@ footer{
   padding: 24px 0 40px;
   font-family: var(--mono); font-size: 11px; color: var(--ink-soft);
   display:flex; justify-content:space-between; flex-wrap:wrap; gap: 12px;
+}
+@media(max-width:860px){
+  footer{ padding-bottom: calc(64px + env(safe-area-inset-bottom, 0px)); }
 }
 
 /* canvas loading — hidden once canvas child is present */
@@ -452,6 +504,27 @@ footer{
   display:flex; justify-content:space-between; align-items:center;
   font-family: var(--mono); font-size: 10px; color: var(--ink-soft); text-transform:uppercase; letter-spacing:0.2em;
   padding: 6px 0;
+}
+
+/* === about grid === */
+.about-grid{
+  display: grid; grid-template-columns: 1fr 1fr; gap: 40px;
+}
+@media(max-width:720px){ .about-grid{ grid-template-columns: 1fr; gap: 20px; } }
+
+/* === global mobile layout === */
+@media(max-width:720px){
+  .section{ padding: 56px 0 28px; }
+}
+@media(max-width:540px){
+  .section{ padding: 40px 0 20px; }
+  .hero-tag{ font-size: 22px; }
+  .hero-badge{ display: none; }
+  .demo-body{ height: 300px; }
+  .corner.tl, .corner.bl{ left: 20px; }
+  .corner.tr, .corner.br{ right: 20px; }
+  .hero-meta{ gap: 12px; flex-direction: column; }
+  .proj .body p{ font-size: 15px; }
 }
 
 /* print styles — clean page export */
